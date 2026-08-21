@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "policygate-ai"
+version = "0.1.0"
+description = "Human-governed change control for AI database provisioning agents"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{name = "Srihari Tubati"}]
+dependencies = [
+  "anthropic>=0.67,<1",
+  "pydantic>=2.11,<3",
+  "requests>=2.32,<3",
+  "reportlab>=4.4,<5",
+  "streamlit>=1.48,<2",
+]
+
+[project.scripts]
+policygate = "policygate.app:main"
+policygate-complete = "policygate.complete_approval:main"
+
+[tool.setuptools.packages.find]
+include = ["policygate*"]

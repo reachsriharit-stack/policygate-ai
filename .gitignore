@@ -1,0 +1,26 @@
+.venv/
+__pycache__/
+*.py[cod]
+.env
+.pytest_cache/
+artifacts/
+.DS_Store
+.streamlit/secrets.toml
+
+# Terraform local working data. State and saved plans can contain sensitive
+# infrastructure information and must never enter source control.
+terraform/
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+crash.log
+crash.*.log
+
+# Local MCP credentials/config
+.vscode/mcp.json
+
+# Local submission captures
+screenshots/
+demo-recordings/

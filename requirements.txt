@@ -1,0 +1,5 @@
+anthropic>=0.67,<1
+pydantic>=2.11,<3
+requests>=2.32,<3
+reportlab>=4.4,<5
+streamlit>=1.48,<2
