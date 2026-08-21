@@ -1,0 +1,2 @@
+Provision a production PostgreSQL database on AWS. Single AZ, no encryption,
+7-day backups, public access enabled, maximum budget $900/month. Approver: Jane Smith.

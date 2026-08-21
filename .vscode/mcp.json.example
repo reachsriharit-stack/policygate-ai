@@ -1,0 +1,19 @@
+{
+  "servers": {
+    "foxit-pdf": {
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/ABSOLUTE/PATH/TO/foxit-pdf-api-mcp-server/python/foxit-pdf-api-mcp-server",
+        "run",
+        "foxit-pdf-api-mcp-server"
+      ],
+      "env": {
+        "FOXIT_CLOUD_API_HOST": "https://na1.fusion.foxit.com/pdf-services",
+        "FOXIT_CLOUD_API_CLIENT_ID": "REPLACE_ME",
+        "FOXIT_CLOUD_API_CLIENT_SECRET": "REPLACE_ME"
+      }
+    }
+  }
+}
