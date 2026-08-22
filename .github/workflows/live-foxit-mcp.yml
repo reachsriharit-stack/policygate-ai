@@ -171,6 +171,17 @@ jobs:
           if not (CLIENT_ID and CLIENT_SECRET and HOST):
               sys.exit("FAIL: Foxit credentials/host missing; refusing to run a 'live' test.")
 
+          # The MCP server's config.py uses this value verbatim as its API base
+          # URL (rstrip("/") only) and appends paths like /api/documents/upload
+          # to it. A host without the /pdf-services suffix therefore aims at the
+          # Foxit website edge, which answers with a Cloudflare challenge page
+          # rather than the API — an HTTP 403 full of HTML. Upstream's own
+          # default and .env.example both carry the suffix, so normalise here
+          # and accept either spelling of the repository variable.
+          base_url = HOST.rstrip("/")
+          if not base_url.endswith("/pdf-services"):
+              base_url = f"{base_url}/pdf-services"
+
           # Everything transient lives outside the repository working tree.
           workdir = Path(os.environ["RUNNER_TEMP"]) / "policygate-foxit-mcp"
           workdir.mkdir(parents=True, exist_ok=True)
@@ -224,6 +235,13 @@ jobs:
           input_sha256 = sha256(input_bytes).hexdigest()
           check("input PDF SHA-256 computed", len(input_sha256) == 64, input_sha256)
 
+          print(f"\nFoxit PDF Services base URL: {base_url}")
+          check(
+              "base URL targets PDF Services",
+              base_url.endswith("/pdf-services"),
+              base_url,
+          )
+
           # The server's own FastMCP instance, run over stdio. Upstream's
           # main() wraps a synchronous FastMCP.run() in asyncio.run(), which
           # raises "a coroutine was expected" while tearing the process down
@@ -239,7 +257,10 @@ jobs:
               "PYTHONUNBUFFERED": "1",
               "FOXIT_CLOUD_API_CLIENT_ID": CLIENT_ID,
               "FOXIT_CLOUD_API_CLIENT_SECRET": CLIENT_SECRET,
-              "FOXIT_CLOUD_API_HOST": HOST,
+              # config.py prefers _BASE_URL over _HOST; set both to the same
+              # normalised value so neither can select an unsuffixed host.
+              "FOXIT_CLOUD_API_BASE_URL": base_url,
+              "FOXIT_CLOUD_API_HOST": base_url,
           }
           params = StdioServerParameters(
               command=sys.executable,
@@ -265,7 +286,14 @@ jobs:
               if not isinstance(payload, dict):
                   fail(f"{tool_name} returned {type(payload).__name__}, expected an object")
               if not payload.get("success"):
-                  fail(f"{tool_name} failed: {json.dumps(payload)[:600]}")
+                  detail = json.dumps(payload)[:600]
+                  if "<!DOCTYPE html" in detail or "<html" in detail:
+                      detail += (
+                          " -- the response was an HTML page, not the JSON API. "
+                          "Check that FOXIT_CLOUD_API_HOST points at the PDF "
+                          "Services base (…/pdf-services)."
+                      )
+                  fail(f"{tool_name} failed: {detail}")
               return payload
 
 
