@@ -1,0 +1,315 @@
+name: Live Foxit PDF Services Smoke Test
+
+# Manual only. This workflow makes a real, authenticated call to the Foxit PDF
+# Services API, so it must never be triggered by push or pull_request.
+#
+# Scope of this milestone: generate a Change Approval / Evidence PDF with
+# PolicyGate's existing renderer and upload it to the real PDF Services API.
+# Foxit eSign is NOT called — no folder is created, no signature is requested,
+# no human is emailed. No Terraform runs and no AWS resource is touched.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-foxit-pdf-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  live-foxit-pdf:
+    name: Real Foxit PDF Services upload (no eSign, no Terraform)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      # Secrets: consumed only by the Python HTTP client via the environment.
+      # They are never echoed, substringed, hashed, or written to logs, and
+      # every string this job prints is scrubbed of both values first.
+      FOXIT_CLOUD_API_CLIENT_ID: ${{ secrets.FOXIT_CLOUD_API_CLIENT_ID }}
+      FOXIT_CLOUD_API_CLIENT_SECRET: ${{ secrets.FOXIT_CLOUD_API_CLIENT_SECRET }}
+      # Repository variable: the PDF Services host. Not a secret.
+      FOXIT_CLOUD_API_HOST: ${{ vars.FOXIT_CLOUD_API_HOST }}
+      # PolicyGate stays on its local, offline paths for everything else.
+      POLICYGATE_INCLUDE_TERRAFORM_PLAN: "false"
+      POLICYGATE_ALLOW_APPLY: "false"
+      POLICYGATE_ALLOW_DESTROY: "false"
+      POLICYGATE_SUBMISSION_MODE: "false"
+      POLICYGATE_FOXIT_SEND_NOW: "false"
+      POLICYGATE_EMBEDDED_SIGNING: "false"
+      PDF_PATH: artifacts/policygate-foxit-smoke.pdf
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Verify Foxit configuration is present
+        run: |
+          set -euo pipefail
+          # Presence tests only. No value is printed, transformed, or compared
+          # against anything that could reveal its contents.
+          missing=0
+          if [ -z "${FOXIT_CLOUD_API_CLIENT_ID:-}" ]; then
+            echo "::error::Secret FOXIT_CLOUD_API_CLIENT_ID is not configured (Settings -> Secrets and variables -> Actions -> Secrets)." >&2
+            missing=1
+          fi
+          if [ -z "${FOXIT_CLOUD_API_CLIENT_SECRET:-}" ]; then
+            echo "::error::Secret FOXIT_CLOUD_API_CLIENT_SECRET is not configured (Settings -> Secrets and variables -> Actions -> Secrets)." >&2
+            missing=1
+          fi
+          if [ -z "${FOXIT_CLOUD_API_HOST:-}" ]; then
+            echo "::error::Repository variable FOXIT_CLOUD_API_HOST is not set (Settings -> Secrets and variables -> Actions -> Variables)." >&2
+            missing=1
+          fi
+          [ "$missing" -eq 0 ] || exit 1
+          echo "Foxit client id: present"
+          echo "Foxit client secret: present"
+          echo "Foxit PDF Services host: configured"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install locked dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -r requirements.lock
+
+      - name: Generate the approval PDF and upload it to Foxit PDF Services
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          import sys
+          from hashlib import sha256
+          from pathlib import Path
+
+          import requests
+
+          # PolicyGate's own renderer and evidence pipeline. No second PDF
+          # implementation lives in this workflow — see policygate/pdf_render.py.
+          import policygate.foxit_client as foxit_mod
+          from policygate.evidence import build_evidence_packet
+          from policygate.parser import parse
+          from policygate.pdf_render import render_evidence_pdf
+          from policygate.planner import build_plan
+          from policygate.rules import evaluate
+
+          REQUEST = (
+              "Provision production PostgreSQL on AWS in us-east-1. "
+              "High availability required, 30-day backups, "
+              "maximum budget $900 per month. "
+              "Approver: Jane Smith, jane@example.com."
+          )
+
+          CLIENT_ID = os.environ.get("FOXIT_CLOUD_API_CLIENT_ID", "")
+          CLIENT_SECRET = os.environ.get("FOXIT_CLOUD_API_CLIENT_SECRET", "")
+          HOST = os.environ.get("FOXIT_CLOUD_API_HOST", "").strip()
+          PDF_PATH = Path(os.environ.get("PDF_PATH", "artifacts/policygate-foxit-smoke.pdf"))
+
+          if not (CLIENT_ID and CLIENT_SECRET and HOST):
+              sys.exit("FAIL: Foxit credentials/host missing; refusing to run a 'live' test.")
+
+
+          def safe(text: object) -> str:
+              """Never let a credential reach the log, even inside an exception
+              message or an API error body echoed back to us."""
+              out = str(text)
+              for secret in (CLIENT_SECRET, CLIENT_ID):
+                  if secret:
+                      out = out.replace(secret, "***REDACTED***")
+              return out
+
+
+          failures: list[str] = []
+
+
+          def check(label: str, ok: bool, detail: str) -> None:
+              print(f"  [{'PASS' if ok else 'FAIL'}] {label}: {safe(detail)}")
+              if not ok:
+                  failures.append(f"{label}: {safe(detail)}")
+
+
+          # --- Guard: Foxit eSign must not be touched by this milestone. -------
+          # No eSign credentials are set for this job, and this tripwire turns
+          # any attempt to route a document for signature into a hard failure.
+          def _esign_forbidden(*_args, **_kwargs):
+              raise RuntimeError(
+                  "Foxit eSign is not part of this milestone; PDF Services only."
+              )
+
+
+          foxit_mod.FoxitESignClient.create_human_approval_draft = _esign_forbidden
+          esign_env = [
+              var
+              for var in ("FOXIT_ESIGN_CLIENT_ID", "FOXIT_ESIGN_CLIENT_SECRET")
+              if os.environ.get(var)
+          ]
+
+          # --- 1. Generate the approval PDF with the existing renderer. --------
+          print("Generating the Change Approval / Evidence PDF with policygate.pdf_render\n")
+          request = parse(REQUEST, requested_by="GitHub Actions live Foxit PDF smoke test")
+          plan = build_plan(request)
+          policy_result = evaluate(request, plan)
+          evidence = build_evidence_packet(policy_result)
+          pdf_bytes = render_evidence_pdf(evidence)
+
+          PDF_PATH.parent.mkdir(parents=True, exist_ok=True)
+          PDF_PATH.write_bytes(pdf_bytes)
+
+          document_id = ""
+          status_code = None
+          try:
+              print("PDF pre-flight")
+              check("PolicyGate validation passed", policy_result.passed, str(policy_result.passed))
+              check("PDF exists", PDF_PATH.is_file(), str(PDF_PATH))
+
+              size = PDF_PATH.stat().st_size if PDF_PATH.is_file() else 0
+              check("PDF size > 0", size > 0, f"{size} bytes")
+
+              on_disk = PDF_PATH.read_bytes() if PDF_PATH.is_file() else b""
+              check("PDF magic bytes", on_disk[:4] == b"%PDF", repr(on_disk[:4]))
+
+              # The hash of the document itself: derived from public content,
+              # unrelated to any credential, and safe to print.
+              pdf_sha256 = sha256(on_disk).hexdigest()
+              check("PDF SHA-256 computed", len(pdf_sha256) == 64, pdf_sha256)
+              check("no eSign credentials in this job", not esign_env, ", ".join(esign_env) or "none present")
+
+              if failures:
+                  for failure in failures:
+                      print(f"::error::{failure}")
+                  sys.exit(
+                      f"FAIL: {len(failures)} pre-flight assertion(s) failed; "
+                      "nothing was uploaded to Foxit."
+                  )
+
+              # --- 2. One real request to Foxit PDF Services. ------------------
+              # .env.example ships the host with the /pdf-services suffix already
+              # attached, so appending it unconditionally would produce a
+              # doubled path. Normalise instead of 404-ing.
+              base = HOST.rstrip("/")
+              if base.endswith("/pdf-services"):
+                  url = f"{base}/api/documents/upload"
+              else:
+                  url = f"{base}/pdf-services/api/documents/upload"
+              print(f"\nPOST {url}")
+
+              headers = {
+                  "client_id": CLIENT_ID,
+                  "client_secret": CLIENT_SECRET,
+              }
+              try:
+                  with PDF_PATH.open("rb") as handle:
+                      response = requests.post(
+                          url,
+                          headers=headers,
+                          files={"file": (PDF_PATH.name, handle, "application/pdf")},
+                          timeout=60,
+                      )
+              except requests.RequestException as exc:
+                  sys.exit(f"FAIL: Foxit PDF Services request failed: {safe(exc)}")
+
+              status_code = response.status_code
+              print(f"HTTP {status_code}")
+              if not response.ok:
+                  # Body only, bounded and scrubbed. Request headers are never
+                  # logged, so the credentials cannot surface here.
+                  sys.exit(
+                      f"FAIL: Foxit PDF Services returned HTTP {status_code}: "
+                      f"{safe(response.text)[:800]}"
+                  )
+
+              # --- 3. Parse the response and require a real documentId. --------
+              try:
+                  payload = response.json()
+              except ValueError:
+                  sys.exit(
+                      "FAIL: Foxit PDF Services response was not JSON: "
+                      f"{safe(response.text)[:800]}"
+                  )
+
+              def find_document_id(value) -> str:
+                  """documentId may sit at the top level or under a data/result
+                  envelope depending on the deployment."""
+                  if isinstance(value, dict):
+                      for key in ("documentId", "document_id", "docId"):
+                          found = value.get(key)
+                          if isinstance(found, str) and found.strip():
+                              return found.strip()
+                      for key in ("data", "result", "results", "response"):
+                          if key in value:
+                              nested = find_document_id(value[key])
+                              if nested:
+                                  return nested
+                  return ""
+
+              document_id = find_document_id(payload)
+              if not document_id:
+                  sys.exit(
+                      "FAIL: Foxit PDF Services did not return a non-empty documentId: "
+                      f"{safe(payload)[:800]}"
+                  )
+
+              # --- 4. Safe summary. --------------------------------------------
+              summary = [
+                  "",
+                  "=" * 72,
+                  "Foxit PDF API: LIVE",
+                  "Upload: PASS",
+                  f"PDF SHA-256: {pdf_sha256}",
+                  f"Foxit documentId: {document_id}",
+                  "eSign: NOT CALLED",
+                  "terraform apply: NOT RUN",
+                  "terraform destroy: NOT RUN",
+                  "=" * 72,
+              ]
+              print("\n".join(summary))
+
+              step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+              if step_summary:
+                  with open(step_summary, "a", encoding="utf-8") as fh:
+                      fh.write("### PolicyGate live Foxit PDF Services smoke test\n\n")
+                      fh.write("| Field | Value |\n| --- | --- |\n")
+                      fh.write("| Foxit PDF API | LIVE |\n")
+                      fh.write("| Upload | PASS |\n")
+                      fh.write(f"| PDF SHA-256 | `{pdf_sha256}` |\n")
+                      fh.write(f"| Foxit documentId | `{document_id}` |\n")
+                      fh.write("| eSign | NOT CALLED |\n")
+                      fh.write("| terraform apply | NOT RUN |\n")
+                      fh.write("| terraform destroy | NOT RUN |\n")
+          finally:
+              # The approval PDF never outlives the test: not uploaded as a
+              # GitHub artifact, not committed, not left on the runner.
+              if PDF_PATH.exists():
+                  PDF_PATH.unlink()
+              print(f"\nLocal PDF deleted: {PDF_PATH}")
+
+          if failures:
+              print("\n" + "=" * 72)
+              for failure in failures:
+                  print(f"::error::{failure}")
+              sys.exit(f"\nFAIL: {len(failures)} Foxit PDF smoke-test assertion(s) failed.")
+          PY
+
+      - name: Verify no PDF was left behind and the tree is clean
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -e "${PDF_PATH}" ]; then
+            echo "::error::Generated PDF still present at ${PDF_PATH}; it must not survive the test." >&2
+            rm -f "${PDF_PATH}"
+            exit 1
+          fi
+          echo "No generated PDF on disk."
+
+          dirty="$(git status --porcelain --untracked-files=all)"
+          if [ -n "${dirty}" ]; then
+            echo "::error::Working tree is not clean; the smoke test left a file behind:" >&2
+            echo "${dirty}" >&2
+            exit 1
+          fi
+          echo "Working tree clean: nothing generated was committed or staged."
