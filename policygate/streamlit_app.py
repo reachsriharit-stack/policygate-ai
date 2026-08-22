@@ -3,6 +3,16 @@ from __future__ import annotations
 
 import os
 import re
+import sys
+from pathlib import Path
+
+# Streamlit Cloud runs this file directly, so sys.path[0] is policygate/ and
+# the `policygate` package itself is not importable. Put the repository root
+# on the path before any package import. Derived from __file__, so it works
+# wherever the checkout lives.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 import streamlit as st
 
