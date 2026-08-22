@@ -102,6 +102,56 @@ class SubmissionModeTests(unittest.TestCase):
         self.assertTrue(status.foxit_mcp.startswith("CONFIGURED"))
         self.assertEqual(status.terraform_plan, "LIVE PLAN")
 
+class DeveloperPlatformSubmissionModeTests(unittest.TestCase):
+    """Submission mode must judge eSign by the transport foxit_client will use,
+    otherwise a fully live gateway setup reads as a mock."""
+
+    LIVE_GATEWAY = {
+        "POLICYGATE_SUBMISSION_MODE": "true",
+        "ANTHROPIC_API_KEY": "test-key",
+        "POLICYGATE_ALLOW_AI_FALLBACK": "false",
+        "FOXIT_ESIGN_TRANSPORT": "developer_platform",
+        "FOXIT_CLOUD_API_CLIENT_ID": "cloud-id",
+        "FOXIT_CLOUD_API_CLIENT_SECRET": "cloud-secret",
+        "FOXIT_ESIGN_CLIENT_ID": "",
+        "FOXIT_ESIGN_CLIENT_SECRET": "",
+        "POLICYGATE_FOXIT_SEND_NOW": "true",
+        "POLICYGATE_EMBEDDED_SIGNING": "false",
+    }
+
+    @patch.dict(os.environ, LIVE_GATEWAY, clear=False)
+    def test_gateway_credentials_satisfy_submission_mode(self):
+        enforce_submission_mode(True)  # must not raise
+
+    @patch.dict(os.environ, LIVE_GATEWAY, clear=False)
+    def test_gateway_credentials_report_esign_live(self):
+        self.assertEqual(get_runtime_status(True).foxit_esign, "LIVE")
+
+    @patch.dict(
+        os.environ,
+        {**LIVE_GATEWAY, "FOXIT_CLOUD_API_CLIENT_ID": "", "FOXIT_CLOUD_API_CLIENT_SECRET": ""},
+        clear=False,
+    )
+    def test_gateway_transport_without_its_credentials_is_rejected(self):
+        with self.assertRaises(RuntimeError):
+            enforce_submission_mode(True)
+
+    @patch.dict(
+        os.environ,
+        {
+            **LIVE_GATEWAY,
+            "FOXIT_ESIGN_TRANSPORT": "esign_oauth",
+            "FOXIT_ESIGN_CLIENT_ID": "",
+            "FOXIT_ESIGN_CLIENT_SECRET": "",
+        },
+        clear=False,
+    )
+    def test_portal_transport_still_requires_portal_credentials(self):
+        # Gateway credentials are present but unused by this transport.
+        with self.assertRaises(RuntimeError):
+            enforce_submission_mode(True)
+
+
 
 if __name__ == "__main__":
     unittest.main()
