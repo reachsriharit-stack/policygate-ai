@@ -1,0 +1,417 @@
+name: Live Foxit eSign Draft
+
+# Manual only. This workflow creates a REAL Foxit eSign folder (envelope) from a
+# PolicyGate approval PDF. It must never be triggered by push or pull_request.
+#
+# Scope of this milestone: prove the draft can be created. sendNow is false, no
+# invitation email is sent, no embedded signing session is requested, and
+# nothing is signed — signing remains exclusively a human action, as it does
+# everywhere else in this repository. No MCP, no Terraform, no Anthropic call.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-foxit-esign-draft-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  live-foxit-esign-draft:
+    name: Real Foxit eSign draft, not sent and not signed
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      # Secrets: used only as request headers by the Python client below, and
+      # never printed. Every string this job logs is scrubbed of both values.
+      FOXIT_CLOUD_API_CLIENT_ID: ${{ secrets.FOXIT_CLOUD_API_CLIENT_ID }}
+      FOXIT_CLOUD_API_CLIENT_SECRET: ${{ secrets.FOXIT_CLOUD_API_CLIENT_SECRET }}
+      FOXIT_ESIGN_CREATEFOLDER_URL: https://na1.fusion.foxit.com/esign/api/v1/folders/createfolder
+      # PolicyGate stays on its local, offline paths.
+      POLICYGATE_INCLUDE_TERRAFORM_PLAN: "false"
+      POLICYGATE_ALLOW_APPLY: "false"
+      POLICYGATE_ALLOW_DESTROY: "false"
+      POLICYGATE_SUBMISSION_MODE: "false"
+      POLICYGATE_FOXIT_SEND_NOW: "false"
+      POLICYGATE_EMBEDDED_SIGNING: "false"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Verify Foxit credentials are present
+        run: |
+          set -euo pipefail
+          # Presence tests only. No value is printed or transformed.
+          missing=0
+          if [ -z "${FOXIT_CLOUD_API_CLIENT_ID:-}" ]; then
+            echo "::error::Secret FOXIT_CLOUD_API_CLIENT_ID is not configured." >&2
+            missing=1
+          fi
+          if [ -z "${FOXIT_CLOUD_API_CLIENT_SECRET:-}" ]; then
+            echo "::error::Secret FOXIT_CLOUD_API_CLIENT_SECRET is not configured." >&2
+            missing=1
+          fi
+          [ "$missing" -eq 0 ] || exit 1
+          echo "Foxit client id: present"
+          echo "Foxit client secret: present"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install locked dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -r requirements.lock
+
+      - name: Create the Foxit eSign draft from a PolicyGate approval PDF
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import base64
+          import json
+          import os
+          import re
+          import sys
+          import zlib
+          from hashlib import sha256
+          from pathlib import Path
+
+          import requests
+          from reportlab.pdfbase.pdfmetrics import stringWidth
+
+          # PolicyGate's own renderer and evidence pipeline — no second approval
+          # PDF generator. See policygate/pdf_render.py.
+          import policygate.parser as parser_mod
+          from policygate.evidence import build_evidence_packet
+          from policygate.parser import parse
+          from policygate.pdf_render import render_evidence_pdf
+          from policygate.planner import build_plan
+          from policygate.rules import evaluate
+
+          REQUEST = (
+              "Provision production PostgreSQL on AWS in us-east-1. "
+              "High availability required, 30-day backups, "
+              "maximum budget $900 per month. "
+              "Approver: Jane Smith, jane@example.com."
+          )
+
+          # The label the renderer puts in front of the signature rule. The
+          # signature field is anchored to it, so the box lands exactly where a
+          # human would sign rather than at a guessed offset.
+          SIGNATURE_LABEL = "Approver signature: "
+          SIGNATURE_FONT = ("Helvetica", 9)
+          # Same box the renderer's own Foxit text tag declares:
+          # ${signfield:1:y:approval_signature:200:30}
+          FIELD_WIDTH, FIELD_HEIGHT = 200, 30
+
+          CLIENT_ID = os.environ.get("FOXIT_CLOUD_API_CLIENT_ID", "")
+          CLIENT_SECRET = os.environ.get("FOXIT_CLOUD_API_CLIENT_SECRET", "")
+          URL = os.environ.get("FOXIT_ESIGN_CREATEFOLDER_URL", "").strip()
+
+          if not (CLIENT_ID and CLIENT_SECRET and URL):
+              sys.exit("FAIL: Foxit credentials/endpoint missing; refusing to run a 'live' test.")
+
+          workdir = Path(os.environ["RUNNER_TEMP"]) / "policygate-esign-draft"
+          workdir.mkdir(parents=True, exist_ok=True)
+          pdf_path = workdir / "PolicyGate Change Approval.pdf"
+
+
+          def safe(text: object) -> str:
+              out = str(text)
+              for secret in (CLIENT_SECRET, CLIENT_ID):
+                  if secret:
+                      out = out.replace(secret, "***REDACTED***")
+              return out
+
+
+          def fail(message: str) -> None:
+              print(f"::error::{safe(message)}")
+              raise SystemExit(f"FAIL: {safe(message)}")
+
+
+          def check(label: str, ok: bool, detail: str) -> None:
+              print(f"  [{'PASS' if ok else 'FAIL'}] {label}: {safe(detail)}")
+              if not ok:
+                  fail(f"{label}: {detail}")
+
+
+          # --- Guards: no Anthropic call, no MCP, no Terraform in this job. ----
+          # The offline parser is deterministic and needs no API key; removing
+          # the key and tripwiring the live parser makes any attempt to reach
+          # Anthropic a hard failure rather than a silent billable call.
+          os.environ.pop("ANTHROPIC_API_KEY", None)
+
+
+          def _anthropic_forbidden(*_args, **_kwargs):
+              raise RuntimeError("Anthropic is not called by this workflow.")
+
+
+          parser_mod.parse_with_claude = _anthropic_forbidden
+
+          # --- 1. Render the approval PDF. -------------------------------------
+          print("Rendering the Change Approval / Evidence PDF with policygate.pdf_render\n")
+          request = parse(REQUEST, requested_by="GitHub Actions live Foxit eSign draft test")
+          plan = build_plan(request)
+          policy_result = evaluate(request, plan)
+          evidence = build_evidence_packet(policy_result)
+          pdf_bytes = render_evidence_pdf(evidence)
+          pdf_path.write_bytes(pdf_bytes)
+
+          folder_id = ""
+          try:
+              on_disk = pdf_path.read_bytes()
+              print("Approval PDF")
+              check("PolicyGate validation passed", policy_result.passed, str(policy_result.passed))
+              check("PDF exists", pdf_path.is_file(), str(pdf_path))
+              check("PDF size > 0", len(on_disk) > 0, f"{len(on_disk)} bytes")
+              check("PDF magic bytes", on_disk[:4] == b"%PDF", repr(on_disk[:4]))
+              pdf_sha256 = sha256(on_disk).hexdigest()
+              check("PDF SHA-256 computed", len(pdf_sha256) == 64, pdf_sha256)
+
+              # --- 2. Derive the signature field position from this PDF. -------
+              def page_streams(raw: bytes) -> list[str]:
+                  """Decoded content streams, in page order. ReportLab writes
+                  ASCII85 + Flate, one content stream per page."""
+                  out: list[str] = []
+                  for match in re.finditer(rb"stream\n(.*?)endstream", raw, re.S):
+                      try:
+                          decoded = zlib.decompress(
+                              base64.a85decode(match.group(1).strip(), adobe=True)
+                          )
+                      except Exception:
+                          continue
+                      out.append(decoded.decode("latin-1"))
+                  return out
+
+              def locate_signature_field(raw: bytes) -> dict:
+                  """Find the signature rule and return a Foxit field box in
+                  page coordinates measured from the top-left corner."""
+                  boxes = re.findall(rb"/MediaBox\s*\[\s*[\d.]+\s+[\d.]+\s+([\d.]+)\s+([\d.]+)\s*\]", raw)
+                  if not boxes:
+                      fail("Could not read /MediaBox from the generated PDF.")
+                  page_height = float(boxes[0][1])
+
+                  for page_index, content in enumerate(page_streams(raw), start=1):
+                      position = content.find(SIGNATURE_LABEL.rstrip())
+                      if position < 0:
+                          continue
+                      # The nearest preceding translate is this paragraph's
+                      # origin; the Tm offset is the baseline within it.
+                      translates = re.findall(
+                          r"1 0 0 1 ([\d.]+) ([\d.]+) cm", content[:position]
+                      )
+                      offsets = re.findall(r"BT 1 0 0 1 ([\d.]+) ([\d.]+) Tm", content[:position])
+                      if not translates:
+                          continue
+                      origin_x, origin_y = (float(v) for v in translates[-1])
+                      offset_x, offset_y = (
+                          (float(v) for v in offsets[-1]) if offsets else (0.0, 0.0)
+                      )
+                      baseline_x = origin_x + offset_x
+                      baseline_y = origin_y + offset_y
+                      # Start the box where the blank rule starts, and sit it on
+                      # the baseline with a little room for descenders.
+                      field_x = baseline_x + stringWidth(SIGNATURE_LABEL, *SIGNATURE_FONT)
+                      field_bottom = baseline_y - 4
+                      field_top = field_bottom + FIELD_HEIGHT
+                      return {
+                          "pageNumber": page_index,
+                          "x": round(field_x, 2),
+                          "y": round(page_height - field_top, 2),
+                      }
+                  fail(
+                      f"Could not locate {SIGNATURE_LABEL!r} in the generated PDF, so no "
+                      "signature field position could be derived. Check policygate/pdf_render.py."
+                  )
+
+              anchor = locate_signature_field(on_disk)
+              page_count = len(page_streams(on_disk))
+              print("\nSignature field (derived from this PDF, not hardcoded)")
+              check(
+                  "page number is within the document",
+                  1 <= anchor["pageNumber"] <= page_count,
+                  f"page {anchor['pageNumber']} of {page_count}",
+              )
+              check(
+                  "field position is on the page",
+                  anchor["x"] > 0 and anchor["y"] > 0,
+                  f"x={anchor['x']} y={anchor['y']} (top-left origin), {FIELD_WIDTH}x{FIELD_HEIGHT}",
+              )
+
+              signature_field = {
+                  "type": "signature",
+                  "documentNumber": 1,
+                  "pageNumber": anchor["pageNumber"],
+                  "partyNumber": 1,
+                  "x": anchor["x"],
+                  "y": anchor["y"],
+                  "width": FIELD_WIDTH,
+                  "height": FIELD_HEIGHT,
+                  "required": True,
+                  "fieldName": "approval_signature",
+              }
+
+              # --- 3. Create the draft. ----------------------------------------
+              payload = {
+                  "folderName": f"PolicyGate Change Approval - {request.request_id}",
+                  "inputType": "base64",
+                  "base64FileString": [base64.b64encode(on_disk).decode("ascii")],
+                  "fileNames": ["PolicyGate Change Approval.pdf"],
+                  # Draft only. No invitation is sent, and no embedded signing
+                  # session is requested — that is a later milestone.
+                  "sendNow": False,
+                  # The renderer also bakes Foxit text tags into the PDF. They
+                  # stay unprocessed here so this draft carries exactly the one
+                  # explicitly positioned signature field below.
+                  "processTextTags": False,
+                  "parties": [
+                      {
+                          "firstName": "Test",
+                          "lastName": "Approver",
+                          "emailId": "test-approver@example.com",
+                          "permission": "FILL_FIELDS_AND_SIGN",
+                          "sequence": 1,
+                      }
+                  ],
+                  "fields": [signature_field],
+              }
+
+              loggable = dict(payload)
+              loggable["base64FileString"] = [f"<{len(on_disk)} bytes, base64>"]
+              print("\nRequest (document bytes elided; credentials are headers and never logged)")
+              print(f"  POST {URL}")
+              for line in json.dumps(loggable, indent=2).splitlines():
+                  print(f"  {line}")
+
+              try:
+                  response = requests.post(
+                      URL,
+                      headers={
+                          "client_id": CLIENT_ID,
+                          "client_secret": CLIENT_SECRET,
+                          "Content-Type": "application/json",
+                      },
+                      json=payload,
+                      timeout=90,
+                  )
+              except requests.RequestException as exc:
+                  fail(f"Foxit eSign request failed: {exc}")
+
+              print(f"\nHTTP {response.status_code}")
+              if not response.ok:
+                  body = safe(response.text)[:800]
+                  if "<!DOCTYPE html" in body or "<html" in body:
+                      body += (
+                          " -- the response was an HTML page, not the JSON API. "
+                          "Check that the createfolder endpoint is correct for this account."
+                      )
+                  fail(f"Foxit eSign returned HTTP {response.status_code}: {body}")
+
+              try:
+                  data = response.json()
+              except ValueError:
+                  fail(f"Foxit eSign response was not JSON: {safe(response.text)[:800]}")
+
+              def find_folder_id(value) -> str:
+                  """The id may sit at the top level or under a folder envelope,
+                  depending on the deployment."""
+                  if isinstance(value, dict):
+                      for key in ("folderId", "envelopeId", "folderID", "id"):
+                          found = value.get(key)
+                          if isinstance(found, (str, int)) and str(found).strip():
+                              return str(found).strip()
+                      for key in ("folder", "data", "result", "response"):
+                          if key in value:
+                              nested = find_folder_id(value[key])
+                              if nested:
+                                  return nested
+                  return ""
+
+              folder_id = find_folder_id(data)
+              if not folder_id:
+                  fail(
+                      "Foxit eSign did not return a folder/envelope ID: "
+                      f"{json.dumps(data)[:800]}"
+                  )
+
+              # A draft must not have been sent. If the response tells us
+              # otherwise, that is a failure, not a detail.
+              status = str(
+                  (data.get("folder") or {}).get("folderStatus")
+                  or data.get("folderStatus")
+                  or ""
+              ).upper()
+              print("\nDraft state")
+              check("folder/envelope ID returned", bool(folder_id), folder_id)
+              check(
+                  "not sent for signature",
+                  status not in {"SENT", "INPROGRESS", "IN_PROGRESS", "EXECUTED", "COMPLETED"},
+                  f"folderStatus={status or 'not reported'}",
+              )
+
+              summary = [
+                  "",
+                  "=" * 72,
+                  "Foxit eSign API: LIVE",
+                  "Draft creation: PASS",
+                  f"Folder/envelope ID: {folder_id}",
+                  f"PDF SHA-256: {pdf_sha256}",
+                  "sendNow: false",
+                  "Email sent: NO",
+                  "Human signature: NOT REQUESTED",
+                  "terraform apply: NOT RUN",
+                  "terraform destroy: NOT RUN",
+                  "=" * 72,
+              ]
+              print("\n".join(summary))
+
+              step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+              if step_summary:
+                  with open(step_summary, "a", encoding="utf-8") as fh:
+                      fh.write("### PolicyGate live Foxit eSign draft\n\n")
+                      fh.write("| Field | Value |\n| --- | --- |\n")
+                      fh.write("| Foxit eSign API | LIVE |\n")
+                      fh.write("| Draft creation | PASS |\n")
+                      fh.write(f"| Folder/envelope ID | `{folder_id}` |\n")
+                      fh.write(f"| PDF SHA-256 | `{pdf_sha256}` |\n")
+                      fh.write(
+                          f"| Signature field | page {signature_field['pageNumber']}, "
+                          f"x={signature_field['x']}, y={signature_field['y']} |\n"
+                      )
+                      fh.write("| sendNow | false |\n")
+                      fh.write("| Email sent | NO |\n")
+                      fh.write("| Human signature | NOT REQUESTED |\n")
+                      fh.write("| terraform apply | NOT RUN |\n")
+                      fh.write("| terraform destroy | NOT RUN |\n")
+          finally:
+              # The approval PDF never outlives the test: not uploaded as a
+              # GitHub artifact, not committed, not left on the runner.
+              if pdf_path.exists():
+                  pdf_path.unlink()
+              print(f"\nLocal PDF deleted: {pdf_path}")
+          PY
+
+      - name: Remove temporary PDFs and verify the tree is clean
+        if: always()
+        run: |
+          set -euo pipefail
+          rm -rf "${RUNNER_TEMP}/policygate-esign-draft"
+          if [ -e "${RUNNER_TEMP}/policygate-esign-draft" ]; then
+            echo "::error::Temporary PDF directory still present after cleanup." >&2
+            exit 1
+          fi
+          echo "Temporary PDFs removed."
+
+          dirty="$(git status --porcelain --untracked-files=all)"
+          if [ -n "${dirty}" ]; then
+            echo "::error::Working tree is not clean; the test left a file behind:" >&2
+            echo "${dirty}" >&2
+            exit 1
+          fi
+          echo "Working tree clean: nothing generated was committed or staged."
