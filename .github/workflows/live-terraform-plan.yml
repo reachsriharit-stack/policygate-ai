@@ -1,0 +1,422 @@
+name: Live Terraform Plan
+
+# Manual only. This workflow assumes a real AWS role via GitHub OIDC and runs a
+# real `terraform plan` against the AWS provider. It is read-only with respect
+# to AWS: it never runs `terraform apply` or `terraform destroy`, and it never
+# creates or modifies any AWS resource. It must never be triggered by push or
+# pull_request.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: live-terraform-plan-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  live-terraform-plan:
+    name: Real AWS-backed Terraform plan (no apply, no destroy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      # PolicyGate runtime switches. The two "allow" flags stay false so the
+      # three independent apply gates and the destroy gate in
+      # policygate/provisioning/terraform_runner.py all fail closed.
+      POLICYGATE_INCLUDE_TERRAFORM_PLAN: "true"
+      POLICYGATE_ALLOW_APPLY: "false"
+      POLICYGATE_ALLOW_DESTROY: "false"
+      POLICYGATE_SUBMISSION_MODE: "false"
+      # Foxit stays unconfigured on purpose: with no credentials the workflow
+      # takes the local mock handoff path and performs no Foxit network I/O.
+      POLICYGATE_FOXIT_SEND_NOW: "false"
+      POLICYGATE_EMBEDDED_SIGNING: "false"
+      # Terraform automation hygiene: never prompt, never colourise.
+      TF_IN_AUTOMATION: "true"
+      TF_INPUT: "0"
+      AWS_REGION: ${{ vars.AWS_REGION }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Verify OIDC configuration variables are present
+        env:
+          AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+        run: |
+          set -euo pipefail
+          # Repository *variables*, not secrets: no AWS access keys are used
+          # anywhere in this workflow.
+          missing=0
+          if [ -z "${AWS_ROLE_ARN:-}" ]; then
+            echo "::error::Repository variable AWS_ROLE_ARN is not set (Settings -> Secrets and variables -> Actions -> Variables)." >&2
+            missing=1
+          fi
+          if [ -z "${AWS_REGION:-}" ]; then
+            echo "::error::Repository variable AWS_REGION is not set (Settings -> Secrets and variables -> Actions -> Variables)." >&2
+            missing=1
+          fi
+          [ "$missing" -eq 0 ] || exit 1
+          echo "AWS_ROLE_ARN and AWS_REGION are configured."
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install locked dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -r requirements.lock
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: 1.14.9
+          # The wrapper re-emits terraform's stdout/stderr through a shim.
+          # PolicyGate parses `terraform show` output directly, so keep the
+          # real binary on PATH.
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials via GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@v6.2.3
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: policygate-live-terraform-plan
+          # Read-only for the duration of a plan.
+          role-duration-seconds: 1800
+
+      - name: Report assumed AWS identity
+        run: |
+          set -euo pipefail
+          # get-caller-identity returns identity metadata only (account, ARN,
+          # principal id). It never returns credentials, and no credential
+          # value is read, echoed, or transformed anywhere in this workflow.
+          account="$(aws sts get-caller-identity --query 'Account' --output text)"
+          arn="$(aws sts get-caller-identity --query 'Arn' --output text)"
+          role="${arn##*/}"
+          echo "AWS account:    ${account}"
+          echo "Assumed ARN:    ${arn}"
+          echo "Role/session:   ${role}"
+          echo "AWS region:     ${AWS_REGION}"
+          {
+            echo "POLICYGATE_AWS_ACCOUNT=${account}"
+            echo "POLICYGATE_AWS_ARN=${arn}"
+          } >> "$GITHUB_ENV"
+
+      - name: Record Terraform version
+        run: |
+          set -euo pipefail
+          version_line="$(terraform -version | head -n 1)"
+          echo "${version_line}"
+          echo "POLICYGATE_TF_VERSION=${version_line}" >> "$GITHUB_ENV"
+
+      - name: Run PolicyGate with a real Terraform plan
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          import policygate.foxit_client as foxit_mod
+          import policygate.provisioning.terraform_runner as tf_runner
+          import policygate.workflow as workflow_mod
+          from policygate.schema import WorkflowState
+
+          REQUEST = (
+              "Provision production PostgreSQL on AWS in us-east-1. "
+              "High availability required, 30-day backups, "
+              "maximum budget $900 per month. "
+              "Approver: Jane Smith, jane@example.com."
+          )
+
+          failures: list[str] = []
+
+
+          def check(label: str, ok: bool, detail: str) -> None:
+              print(f"  [{'PASS' if ok else 'FAIL'}] {label}: {detail}")
+              if not ok:
+                  failures.append(f"{label}: {detail}")
+
+
+          # --- Guard 1: apply and destroy are unreachable in this process. ------
+          # terraform_runner._run is the single funnel every terraform
+          # subprocess goes through, so wrapping it both records what actually
+          # ran and hard-stops a mutating verb even if some other code path
+          # tried to reach one. run_apply/run_destroy are additionally replaced
+          # so an attempted call fails before it can build a command line.
+          executed_commands: list[list[str]] = []
+          _real_run = tf_runner._run
+
+
+          def _tracked_run(workdir, args):
+              executed_commands.append(list(args))
+              verb = args[0] if args else ""
+              if verb in {"apply", "destroy"}:
+                  raise RuntimeError(
+                      f"terraform {verb} is not permitted in this workflow"
+                  )
+              return _real_run(workdir, args)
+
+
+          def _mutation_forbidden(*_args, **_kwargs):
+              raise RuntimeError(
+                  "terraform apply/destroy is not permitted in this workflow"
+              )
+
+
+          tf_runner._run = _tracked_run
+          tf_runner.run_apply = _mutation_forbidden
+          tf_runner.run_destroy = _mutation_forbidden
+
+          # --- Guard 2: no Foxit network I/O. ----------------------------------
+          # Unset credentials keep FoxitESignClient.configured False, which routes
+          # the workflow to the local mock handoff. The tripwire below turns any
+          # regression in that routing into a hard failure instead of a live call.
+          for var in (
+              "FOXIT_ESIGN_CLIENT_ID",
+              "FOXIT_ESIGN_CLIENT_SECRET",
+              "FOXIT_CLOUD_API_CLIENT_ID",
+              "FOXIT_CLOUD_API_CLIENT_SECRET",
+          ):
+              os.environ.pop(var, None)
+
+
+          def _foxit_forbidden(*_args, **_kwargs):
+              raise RuntimeError("Foxit calls are not permitted in this workflow")
+
+
+          foxit_mod.FoxitESignClient.create_human_approval_draft = _foxit_forbidden
+
+          print("Running PolicyGate with POLICYGATE_INCLUDE_TERRAFORM_PLAN=true")
+          print("Terraform path: init -> validate -> plan -out=tfplan -> show")
+          print("(driven by policygate.provisioning.plan_binding.generate_and_plan)\n")
+
+          try:
+              result = workflow_mod.run_workflow(
+                  REQUEST,
+                  requested_by="GitHub Actions live terraform plan",
+                  include_terraform_plan=True,
+              )
+          except Exception as exc:  # noqa: BLE001 - any failure fails the build
+              sys.exit(
+                  f"FAIL: PolicyGate live terraform plan raised "
+                  f"{type(exc).__name__}: {exc}"
+              )
+
+          request = result.policy_result.request
+          plan = result.policy_result.plan
+          workdir = Path("terraform") / request.request_id
+
+          print("Parsed intent")
+          check("environment", request.environment == "production", str(request.environment))
+          check("database engine", request.database_engine == "postgresql", str(request.database_engine))
+          check("cloud", request.cloud == "aws", str(request.cloud))
+          check("region", request.region == "us-east-1", str(request.region))
+          check("high availability", request.high_availability is True, str(request.high_availability))
+          check("backup retention days", request.backup_retention_days == 30, str(request.backup_retention_days))
+          check(
+              "monthly budget usd",
+              request.monthly_budget_usd is not None and float(request.monthly_budget_usd) == 900.0,
+              str(request.monthly_budget_usd),
+          )
+          check("approver email", request.approver_email == "jane@example.com", str(request.approver_email))
+
+          print("\nDeterministic guardrails")
+          for rule in result.policy_result.checks:
+              check(rule.code, rule.passed, f"{rule.description} (actual={rule.actual}; expected={rule.expected})")
+          check("PolicyGate validation passed", result.policy_result.passed, str(result.policy_result.passed))
+          check(
+              "not blocked",
+              result.state != WorkflowState.BLOCKED,
+              str(getattr(result.state, "value", result.state)),
+          )
+
+          print("\nTerraform execution")
+          verbs = [cmd[0] for cmd in executed_commands if cmd]
+          check("terraform init ran", "init" in verbs, " ".join(verbs) or "<none>")
+          check("terraform validate ran", "validate" in verbs, " ".join(verbs) or "<none>")
+          check("terraform plan ran", "plan" in verbs, " ".join(verbs) or "<none>")
+          check("terraform show ran", "show" in verbs, " ".join(verbs) or "<none>")
+          check("terraform apply NOT run", "apply" not in verbs, "no apply command was issued")
+          check("terraform destroy NOT run", "destroy" not in verbs, "no destroy command was issued")
+          check(
+              "no mutating terraform verb issued",
+              not ({"apply", "destroy", "import", "taint", "untaint", "state"} & set(verbs)),
+              " ".join(verbs) or "<none>",
+          )
+
+          plan_path = workdir / "tfplan"
+          check("tfplan file exists", plan_path.is_file(), str(plan_path))
+          check(
+              "no terraform state written",
+              not list(workdir.glob("terraform.tfstate*")),
+              "terraform.tfstate absent (nothing was applied)",
+          )
+
+          terraform_plan = (result.evidence or {}).get("terraform_plan") or {}
+          evidence_hash = terraform_plan.get("plan_file_sha256")
+          plan_summary = (terraform_plan.get("plan_summary") or "").strip()
+          check(
+              "terraform plan included in PolicyGate evidence",
+              bool(terraform_plan) and bool(evidence_hash) and bool(plan_summary),
+              "evidence.terraform_plan present with summary and hash",
+          )
+
+          recomputed_hash = None
+          if plan_path.is_file():
+              try:
+                  # Independent re-hash of the bytes on disk, through the same
+                  # public interface the approval gate uses at apply time.
+                  recomputed_hash = tf_runner.hash_plan_file(workdir)
+              except Exception as exc:  # noqa: BLE001
+                  failures.append(f"tfplan SHA-256 could not be generated: {exc}")
+          check(
+              "tfplan SHA-256 computed",
+              bool(recomputed_hash) and len(recomputed_hash or "") == 64,
+              recomputed_hash or "<not generated>",
+          )
+          check(
+              "evidence hash matches tfplan on disk",
+              bool(recomputed_hash) and recomputed_hash == evidence_hash,
+              f"evidence={evidence_hash} disk={recomputed_hash}",
+          )
+
+          print("\nSafety boundaries")
+          check(
+              "no live Foxit call",
+              result.handoff is not None and result.handoff.mock is True,
+              f"handoff provider={getattr(result.handoff, 'provider', None)}",
+          )
+          check(
+              "agent may not sign",
+              (result.evidence or {}).get("agent_may_sign") is False,
+              "agent_may_sign=false",
+          )
+          check(
+              "apply gate still closed",
+              os.environ.get("POLICYGATE_ALLOW_APPLY") == "false",
+              "POLICYGATE_ALLOW_APPLY=false",
+          )
+          check(
+              "destroy gate still closed",
+              os.environ.get("POLICYGATE_ALLOW_DESTROY") == "false",
+              "POLICYGATE_ALLOW_DESTROY=false",
+          )
+
+          print("\nFinal state")
+          state = str(getattr(result.state, "value", result.state))
+          check(
+              "workflow state",
+              result.state == WorkflowState.AWAITING_HUMAN_APPROVAL,
+              state,
+          )
+
+          # Resource counts come from the saved plan's own `terraform show`
+          # output, which is the text bound into the approval document.
+          counts_match = re.search(
+              r"Plan:\s+(\d+)\s+to add,\s+(\d+)\s+to change,\s+(\d+)\s+to destroy",
+              plan_summary,
+          )
+          if counts_match:
+              add, change, destroy = counts_match.groups()
+          elif "No changes" in plan_summary:
+              add = change = destroy = "0"
+          else:
+              add = change = destroy = "unknown"
+              failures.append("resource add/change/destroy counts could not be parsed from terraform show output")
+
+          summary_lines = [
+              "",
+              "=" * 72,
+              "POLICYGATE LIVE TERRAFORM PLAN — SAFE SUMMARY",
+              "=" * 72,
+              f"  Terraform version:  {os.getenv('POLICYGATE_TF_VERSION', 'unknown')}",
+              f"  AWS region:         {os.getenv('AWS_REGION', 'unknown')}",
+              f"  Plan region:        {plan.region}",
+              f"  Resources to add:       {add}",
+              f"  Resources to change:    {change}",
+              f"  Resources to destroy:   {destroy}",
+              f"  tfplan SHA-256:     {recomputed_hash or '<not generated>'}",
+              f"  terraform apply:    NOT RUN",
+              f"  terraform destroy:  NOT RUN",
+              f"  Final workflow state: {state}",
+              "=" * 72,
+          ]
+          print("\n".join(summary_lines))
+
+          step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if step_summary:
+              with open(step_summary, "a", encoding="utf-8") as fh:
+                  fh.write("### PolicyGate live Terraform plan\n\n")
+                  fh.write("| Field | Value |\n| --- | --- |\n")
+                  fh.write(f"| Terraform version | {os.getenv('POLICYGATE_TF_VERSION', 'unknown')} |\n")
+                  fh.write(f"| AWS region | {os.getenv('AWS_REGION', 'unknown')} |\n")
+                  fh.write(f"| Resources add / change / destroy | {add} / {change} / {destroy} |\n")
+                  fh.write(f"| tfplan SHA-256 | `{recomputed_hash or 'not generated'}` |\n")
+                  fh.write("| terraform apply | NOT RUN |\n")
+                  fh.write("| terraform destroy | NOT RUN |\n")
+                  fh.write(f"| Final workflow state | {state} |\n")
+
+          github_env = os.environ.get("GITHUB_ENV")
+          if github_env:
+              with open(github_env, "a", encoding="utf-8") as fh:
+                  fh.write(f"POLICYGATE_TF_WORKDIR={workdir}\n")
+
+          if failures:
+              print("\n" + "=" * 72)
+              for failure in failures:
+                  print(f"::error::{failure}")
+              sys.exit(f"\nFAIL: {len(failures)} live terraform-plan assertion(s) failed.")
+
+          print("\nPASS: real terraform plan produced; stopped at AWAITING_HUMAN_APPROVAL.")
+          PY
+
+      - name: Verify nothing was applied and no sensitive file escaped
+        run: |
+          set -euo pipefail
+          workdir="${POLICYGATE_TF_WORKDIR:?PolicyGate did not report a Terraform working directory}"
+
+          # A successful apply writes state. Its absence is an independent,
+          # filesystem-level confirmation that nothing was created in AWS.
+          if compgen -G "${workdir}/terraform.tfstate*" > /dev/null; then
+            echo "::error::Terraform state file found in ${workdir}; something was applied." >&2
+            exit 1
+          fi
+          echo "No terraform state file present: nothing was applied."
+
+          if [ ! -s "${workdir}/tfplan" ]; then
+            echo "::error::Expected a non-empty saved plan at ${workdir}/tfplan." >&2
+            exit 1
+          fi
+          echo "Saved plan present at ${workdir}/tfplan (not uploaded, not committed)."
+
+          # Nothing this workflow produced may be commit-able. The plan file,
+          # provider cache, state and any credential material all live under
+          # gitignored paths, so a clean tree is the assertion.
+          dirty="$(git status --porcelain --untracked-files=all)"
+          if [ -n "${dirty}" ]; then
+            echo "::error::Working tree is not clean; a generated file is not ignored:" >&2
+            echo "${dirty}" >&2
+            exit 1
+          fi
+          echo "Working tree clean: tfplan, .terraform/, state, .env and credentials stay local."
+
+      - name: Remove local Terraform artifacts
+        if: always()
+        run: |
+          set -euo pipefail
+          # Belt and braces: the runner is ephemeral, but the plan file and
+          # provider cache are removed explicitly so nothing survives into a
+          # later step or a cached path.
+          rm -rf terraform .terraform
+          find . -name 'tfplan' -o -name 'terraform.tfstate' -o -name 'terraform.tfstate.*' \
+            | xargs -r rm -f
+          echo "Local Terraform artifacts removed."
