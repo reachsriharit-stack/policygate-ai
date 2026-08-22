@@ -24,6 +24,22 @@ mode before the live demo.
 For a conference demo, embedded signing changes only the UI surface: the human still
 performs the signature. Do not pass a signer session URL to an autonomous agent.
 
+## Two transports to the same eSign API
+
+`FOXIT_ESIGN_TRANSPORT` selects how `foxit_client.py` reaches eSign:
+
+- `esign_oauth` (default) — the eSign portal host, exchanging
+  `FOXIT_ESIGN_CLIENT_ID`/`FOXIT_ESIGN_CLIENT_SECRET` for a bearer token, routes
+  under `/api`.
+- `developer_platform` — the Foxit Developer Platform gateway
+  (`https://na1.fusion.foxit.com`), authenticating every request with
+  `client_id`/`client_secret` headers taken from the same `FOXIT_CLOUD_API_*`
+  credentials the PDF Services API uses, routes under `/esign/api/v1`.
+
+Only the host, route prefix and authentication differ. The request bodies and
+the human-approval boundary are identical, and neither transport has a method
+that signs.
+
 ## Finalize after the human signs
 
 With live Foxit credentials:

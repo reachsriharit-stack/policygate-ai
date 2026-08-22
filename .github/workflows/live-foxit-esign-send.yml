@@ -1,0 +1,408 @@
+name: Live Foxit eSign Send
+
+# Manual only, and it really sends. This runs PolicyGate end to end against the
+# real Foxit eSign API with sendNow=true, so the named signer receives an actual
+# signing invitation by email.
+#
+# The agent stops at the handoff. There is no sign() in this repository: nothing
+# here signs, auto-accepts, applies a saved signature, or marks the request
+# APPROVED. No Terraform runs and no AWS resource is touched.
+on:
+  workflow_dispatch:
+    inputs:
+      signer_first_name:
+        description: 'First name of the human signer.'
+        required: true
+      signer_last_name:
+        description: 'Last name of the human signer.'
+        required: true
+      signer_email:
+        description: 'Email address that will receive the Foxit signing invitation.'
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-foxit-esign-send-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  live-foxit-esign-send:
+    name: Real Foxit eSign send, stopping at AWAITING_HUMAN_APPROVAL
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      # Secrets: request headers only, never printed.
+      FOXIT_CLOUD_API_CLIENT_ID: ${{ secrets.FOXIT_CLOUD_API_CLIENT_ID }}
+      FOXIT_CLOUD_API_CLIENT_SECRET: ${{ secrets.FOXIT_CLOUD_API_CLIENT_SECRET }}
+      # Reach the eSign API through the Developer Platform gateway, which
+      # authenticates with those same credentials. See policygate/foxit_client.py.
+      FOXIT_ESIGN_TRANSPORT: developer_platform
+      FOXIT_ESIGN_BASE_URL: https://na1.fusion.foxit.com
+      # The signer comes from the dispatch inputs; no address is committed here.
+      POLICYGATE_SIGNER_FIRST_NAME: ${{ inputs.signer_first_name }}
+      POLICYGATE_SIGNER_LAST_NAME: ${{ inputs.signer_last_name }}
+      POLICYGATE_SIGNER_EMAIL: ${{ inputs.signer_email }}
+      # This is the one workflow where routing is deliberately live.
+      POLICYGATE_FOXIT_SEND_NOW: "true"
+      # Everything else stays closed.
+      POLICYGATE_EMBEDDED_SIGNING: "false"
+      POLICYGATE_INCLUDE_TERRAFORM_PLAN: "false"
+      POLICYGATE_ALLOW_APPLY: "false"
+      POLICYGATE_ALLOW_DESTROY: "false"
+      POLICYGATE_SUBMISSION_MODE: "false"
+      AUDIT_PATH: ${{ github.workspace }}/../pre-sign-audit.json
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Verify credentials and signer are present
+        run: |
+          set -euo pipefail
+          # Presence tests only. No credential value is printed or transformed.
+          missing=0
+          if [ -z "${FOXIT_CLOUD_API_CLIENT_ID:-}" ]; then
+            echo "::error::Secret FOXIT_CLOUD_API_CLIENT_ID is not configured." >&2
+            missing=1
+          fi
+          if [ -z "${FOXIT_CLOUD_API_CLIENT_SECRET:-}" ]; then
+            echo "::error::Secret FOXIT_CLOUD_API_CLIENT_SECRET is not configured." >&2
+            missing=1
+          fi
+          if [ -z "${POLICYGATE_SIGNER_EMAIL:-}" ]; then
+            echo "::error::signer_email input is empty." >&2
+            missing=1
+          fi
+          case "${POLICYGATE_SIGNER_EMAIL:-}" in
+            *@*.*) ;;
+            *) echo "::error::signer_email does not look like an email address." >&2; missing=1 ;;
+          esac
+          [ "$missing" -eq 0 ] || exit 1
+          echo "Foxit client id: present"
+          echo "Foxit client secret: present"
+          echo "Signer: ${POLICYGATE_SIGNER_FIRST_NAME} ${POLICYGATE_SIGNER_LAST_NAME} <${POLICYGATE_SIGNER_EMAIL}>"
+          echo "A real signing invitation will be sent to that address."
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install locked dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -r requirements.lock
+
+      - name: Route the approval to the human signer
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          import sys
+          from hashlib import sha256
+          from pathlib import Path
+
+          import requests
+
+          # PolicyGate's own pipeline end to end: parse -> plan -> policy ->
+          # evidence -> PDF -> Foxit handoff -> pre-sign audit -> stop. This
+          # job supplies configuration and verification, not a second client.
+          import policygate.parser as parser_mod
+          import policygate.provisioning.terraform_runner as tf_runner
+          import policygate.workflow as workflow_mod
+          from policygate.audit import write_audit_record
+          from policygate.foxit_client import FoxitESignClient
+          from policygate.provisioning.approval_gate import (
+              ProvisioningNotAuthorized,
+              authorize_provisioning,
+          )
+          from policygate.schema import WorkflowState
+
+          REQUEST = (
+              "Provision production PostgreSQL on AWS in us-east-1. "
+              "High availability required, 30-day backups, "
+              "maximum budget $900 per month. "
+              "Approver: Jane Smith, jane@example.com."
+          )
+          EXPECTED_ENDPOINT = "https://na1.fusion.foxit.com/esign/api/v1/folders/createfolder"
+
+          CLIENT_ID = os.environ.get("FOXIT_CLOUD_API_CLIENT_ID", "")
+          CLIENT_SECRET = os.environ.get("FOXIT_CLOUD_API_CLIENT_SECRET", "")
+          FIRST_NAME = (os.environ.get("POLICYGATE_SIGNER_FIRST_NAME") or "").strip()
+          LAST_NAME = (os.environ.get("POLICYGATE_SIGNER_LAST_NAME") or "").strip()
+          SIGNER_EMAIL = (os.environ.get("POLICYGATE_SIGNER_EMAIL") or "").strip()
+          AUDIT_PATH = Path(os.environ["AUDIT_PATH"])
+
+          if not (CLIENT_ID and CLIENT_SECRET and SIGNER_EMAIL):
+              sys.exit("FAIL: Foxit credentials or signer missing; refusing to run a 'live' send.")
+
+
+          def safe(text: object) -> str:
+              out = str(text)
+              for secret in (CLIENT_SECRET, CLIENT_ID):
+                  if secret:
+                      out = out.replace(secret, "***REDACTED***")
+              return out
+
+
+          def fail(message: str) -> None:
+              print(f"::error::{safe(message)}")
+              raise SystemExit(f"FAIL: {safe(message)}")
+
+
+          def check(label: str, ok: bool, detail: str) -> None:
+              print(f"  [{'PASS' if ok else 'FAIL'}] {label}: {safe(detail)}")
+              if not ok:
+                  fail(f"{label}: {detail}")
+
+
+          # --- Guards: no Terraform, no AWS, no Anthropic call. ----------------
+          def _terraform_forbidden(*_args, **_kwargs):
+              raise RuntimeError("Terraform is not permitted in this workflow.")
+
+
+          tf_runner._run = _terraform_forbidden
+          tf_runner.run_apply = _terraform_forbidden
+          tf_runner.run_destroy = _terraform_forbidden
+          workflow_mod.generate_and_plan = _terraform_forbidden
+
+          os.environ.pop("ANTHROPIC_API_KEY", None)
+
+
+          def _anthropic_forbidden(*_args, **_kwargs):
+              raise RuntimeError("Anthropic is not called by this workflow.")
+
+
+          parser_mod.parse_with_claude = _anthropic_forbidden
+
+
+          # --- Record what the real client sends, without replacing it. --------
+          # PolicyGate's own FoxitESignClient performs the call; this session
+          # only observes it so the assertions below are made against the
+          # request that actually went to Foxit.
+          class RecordingSession(requests.Session):
+              calls: list[dict] = []
+
+              def post(self, url, **kwargs):  # type: ignore[override]
+                  RecordingSession.calls.append(
+                      {
+                          "url": url,
+                          "json": kwargs.get("json"),
+                          "header_names": sorted((kwargs.get("headers") or {}).keys()),
+                      }
+                  )
+                  return super().post(url, **kwargs)
+
+
+          workflow_mod.FoxitESignClient = lambda *a, **k: FoxitESignClient(
+              session=RecordingSession()
+          )
+
+          print(f"Routing a production change approval to {FIRST_NAME} {LAST_NAME} <{SIGNER_EMAIL}>")
+          print("PolicyGate runs its own workflow; Foxit routes the invitation to the human.\n")
+
+          signer_name = " ".join(part for part in (FIRST_NAME, LAST_NAME) if part) or "Human Approver"
+          try:
+              result = workflow_mod.run_workflow(
+                  REQUEST,
+                  requested_by="GitHub Actions live Foxit eSign send",
+                  approver_name=signer_name,
+                  approver_email=SIGNER_EMAIL,
+                  include_terraform_plan=False,
+              )
+          except Exception as exc:  # noqa: BLE001 - any failure fails the build
+              fail(f"PolicyGate workflow raised {type(exc).__name__}: {exc}")
+
+          evidence = result.evidence or {}
+          audit = result.audit_record or {}
+          pdf_bytes = result.pdf_bytes or b""
+          pdf_sha256 = sha256(pdf_bytes).hexdigest()
+
+          print("PolicyGate result")
+          check("PolicyGate validation passed", result.policy_result.passed, str(result.policy_result.passed))
+          check("approval PDF rendered", pdf_bytes[:4] == b"%PDF", f"{len(pdf_bytes)} bytes")
+          check("approval PDF SHA-256 computed", len(pdf_sha256) == 64, pdf_sha256)
+          check("no terraform plan bound", "terraform_plan" not in evidence, "terraform_plan absent")
+
+          # --- What actually went to Foxit. ------------------------------------
+          posts = [call for call in RecordingSession.calls if "createfolder" in call["url"]]
+          if not posts:
+              fail("No createfolder request was observed; nothing was routed.")
+          sent = posts[-1]
+          payload = sent["json"] or {}
+          parties = payload.get("parties") or []
+
+          print("\nFoxit eSign request")
+          check("live Foxit client used", result.handoff is not None and not result.handoff.mock, "not the mock handoff")
+          check("documented endpoint", sent["url"] == EXPECTED_ENDPOINT, sent["url"])
+          check(
+              "authenticated with client_id/client_secret headers",
+              {"client_id", "client_secret"}.issubset(set(sent["header_names"])),
+              ", ".join(sent["header_names"]),
+          )
+          check("sendNow was true", payload.get("sendNow") is True, str(payload.get("sendNow")))
+          check("exactly one signing party", len(parties) == 1, f"{len(parties)} parties")
+          check(
+              "the dispatch input is the signing party",
+              parties and parties[0].get("emailId") == SIGNER_EMAIL,
+              str(parties[0].get("emailId")) if parties else "none",
+          )
+          check(
+              "party may fill and sign",
+              parties and parties[0].get("permission") == "FILL_FIELDS_AND_SIGN",
+              str(parties[0].get("permission")) if parties else "none",
+          )
+          for forbidden in (
+              "createExecutedFolder",
+              "signNow",
+              "signature",
+              "savedSignature",
+              "useSavedSignature",
+              "createEmbeddedSigningSession",
+          ):
+              check(f"no {forbidden}", forbidden not in payload, "absent from the request")
+
+          print("\nHuman approval boundary")
+          folder_id = result.handoff.folder_id if result.handoff else ""
+          # foxit_client falls back to the literal "unknown" when a response
+          # carries no folderId. A later verification workflow cannot look up
+          # "unknown", so treat it as a failed capture rather than an ID.
+          check(
+              "folder ID captured",
+              bool(folder_id) and folder_id.lower() != "unknown",
+              folder_id or "none returned",
+          )
+          check(
+              "workflow state",
+              result.state == WorkflowState.AWAITING_HUMAN_APPROVAL,
+              str(getattr(result.state, "value", result.state)),
+          )
+          check("audit state", audit.get("state") == "AWAITING_HUMAN_APPROVAL", str(audit.get("state")))
+          check("request is not APPROVED", audit.get("state") != "APPROVED", "no approval recorded")
+          check("agent may not sign", evidence.get("agent_may_sign") is False, "agent_may_sign=false")
+          check(
+              "no verified signer yet",
+              audit.get("verified_signer_email") is None,
+              "verified_signer_email=None",
+          )
+          check(
+              "expected signer recorded",
+              (audit.get("expected_signer_email") or "").lower() == SIGNER_EMAIL.lower(),
+              str(audit.get("expected_signer_email")),
+          )
+
+          # The gate must refuse until a human has actually signed.
+          try:
+              authorize_provisioning(audit, evidence)
+          except ProvisioningNotAuthorized as exc:
+              check("provisioning refused before signature", True, str(exc).split(".")[0])
+          else:
+              fail("authorize_provisioning() allowed provisioning before any human signed.")
+
+          # --- Metadata for the later verification workflow. -------------------
+          # PolicyGate's own pre-sign audit record: request id, folder id,
+          # expected signer, approval PDF hash, and the approved Terraform plan
+          # hash when one exists. No credentials, no tokens, no Terraform state,
+          # and not the PDF itself.
+          write_audit_record(audit, AUDIT_PATH)
+          preserved = json.loads(AUDIT_PATH.read_text(encoding="utf-8"))
+
+          required = {
+              "request_id": preserved.get("request_id"),
+              "foxit_folder_id": preserved.get("foxit_folder_id"),
+              "expected_signer_email": preserved.get("expected_signer_email"),
+              "unsigned_pdf_sha256": preserved.get("unsigned_pdf_sha256"),
+          }
+          print("\nPreserved verification metadata")
+          for key, value in required.items():
+              check(f"{key} present", bool(value), str(value))
+          check(
+              "terraform plan hash carried when present",
+              "terraform_plan_file_sha256" in preserved,
+              str(preserved.get("terraform_plan_file_sha256")),
+          )
+          check(
+              "approval PDF hash matches what was sent",
+              preserved.get("unsigned_pdf_sha256") == pdf_sha256,
+              pdf_sha256,
+          )
+
+          serialized = json.dumps(preserved)
+          leaked = [
+              value for value in (CLIENT_ID, CLIENT_SECRET) if value and value in serialized
+          ]
+          check("no credential in the preserved metadata", not leaked, "credentials absent")
+          check(
+              "no token or state key in the preserved metadata",
+              not any(
+                  key.lower().find(token) >= 0
+                  for key in preserved
+                  for token in ("token", "secret", "client_id", "tfstate")
+              ),
+              ", ".join(sorted(preserved)),
+          )
+
+          summary = [
+              "",
+              "=" * 72,
+              "Foxit eSign API: LIVE",
+              "Signing request sent: PASS",
+              f"Folder ID: {folder_id}",
+              f"Expected signer: {SIGNER_EMAIL}",
+              "sendNow: true",
+              "Agent signed: NO",
+              "Workflow state: AWAITING_HUMAN_APPROVAL",
+              "=" * 72,
+          ]
+          print("\n".join(summary))
+
+          step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if step_summary:
+              with open(step_summary, "a", encoding="utf-8") as fh:
+                  fh.write("### PolicyGate live Foxit eSign send\n\n")
+                  fh.write("| Field | Value |\n| --- | --- |\n")
+                  fh.write("| Foxit eSign API | LIVE |\n")
+                  fh.write("| Signing request sent | PASS |\n")
+                  fh.write(f"| Folder ID | `{folder_id}` |\n")
+                  fh.write(f"| Request ID | `{preserved.get('request_id', '')}` |\n")
+                  fh.write(f"| Expected signer | {SIGNER_EMAIL} |\n")
+                  fh.write(f"| Approval PDF SHA-256 | `{pdf_sha256}` |\n")
+                  fh.write("| sendNow | true |\n")
+                  fh.write("| Agent signed | NO |\n")
+                  fh.write("| Workflow state | AWAITING_HUMAN_APPROVAL |\n")
+
+          print(
+              "\nThe signer must now open the Foxit invitation and sign. PolicyGate "
+              "has stopped: nothing is polled, nothing is approved, and nothing is "
+              "provisioned until a verified signature exists."
+          )
+          PY
+
+      - name: Preserve the pre-sign audit metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: policygate-pre-sign-audit-${{ github.run_id }}
+          # Non-secret verification metadata only: request id, folder id,
+          # expected signer, approval PDF hash, approved plan hash. The approval
+          # PDF, credentials and Terraform state are never uploaded.
+          path: ${{ github.workspace }}/../pre-sign-audit.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Remove the local audit file and verify the tree is clean
+        if: always()
+        run: |
+          set -euo pipefail
+          rm -f "${AUDIT_PATH}"
+          dirty="$(git status --porcelain --untracked-files=all)"
+          if [ -n "${dirty}" ]; then
+            echo "::error::Working tree is not clean; the run left a file behind:" >&2
+            echo "${dirty}" >&2
+            exit 1
+          fi
+          echo "Working tree clean: no PDF, evidence or audit file was committed or staged."
