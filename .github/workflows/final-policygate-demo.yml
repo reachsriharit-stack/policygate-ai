@@ -165,6 +165,7 @@ jobs:
           set -euo pipefail
           export AUDIT_PATH="${RUNNER_TEMP}/pre-sign-audit.json"
           export FINAL_AUDIT_PATH="${RUNNER_TEMP}/final-audit.json"
+          export DEMO_EVIDENCE_PATH="${RUNNER_TEMP}/demo-evidence.json"
           export DEMO_WORKDIR="${RUNNER_TEMP}/policygate-final-demo"
           python - <<'PY'
           import asyncio
@@ -187,6 +188,7 @@ jobs:
           # MCP-processed one, which workflow.run_workflow() has no hook for.
           import policygate.parser as parser_mod
           import policygate.provisioning.terraform_runner as tf_runner
+          from policygate import demo_evidence
           from policygate.approval_wait import (
               ApprovalTimeout,
               FolderMismatch,
@@ -239,6 +241,7 @@ jobs:
           signed_pdf_path = workdir / "policygate-change-approval-signed.pdf"
           AUDIT_PATH = Path(os.environ["AUDIT_PATH"])
           FINAL_AUDIT_PATH = Path(os.environ["FINAL_AUDIT_PATH"])
+          DEMO_EVIDENCE_PATH = Path(os.environ["DEMO_EVIDENCE_PATH"])
 
 
           def safe(text: object) -> str:
@@ -593,7 +596,8 @@ jobs:
                   bool(folder_id) and folder_id.lower() != "unknown",
                   folder_id or "none returned",
               )
-              check("live Foxit handoff", handoff.mock is False, handoff.provider)
+              result_is_live_esign = handoff.mock is False
+              check("live Foxit handoff", result_is_live_esign, handoff.provider)
 
               # ================= 7. Human approval boundary ===================
               print("\n7. Human approval boundary")
@@ -760,6 +764,35 @@ jobs:
                   json.dumps(final_audit, indent=2, sort_keys=True, default=str), encoding="utf-8"
               )
 
+              # Sanitized record for the demo UI: booleans, counts, hashes and
+              # states only. demo_evidence.build() drops anything outside its
+              # allowlist and refuses identity-bearing values, so no signer
+              # address, folder ID, account or credential can reach a screen.
+              ui_evidence = demo_evidence.build(
+                  claude_live=live_calls["count"] > 0,
+                  policy_passed=policy_result.passed,
+                  terraform_live_plan=True,
+                  resources_added=int(add),
+                  resources_changed=int(change),
+                  resources_destroyed=int(destroy),
+                  terraform_plan_sha256=tfplan_sha256,
+                  terraform_plan_summary=plan_summary,
+                  foxit_mcp_live=bool(mcp_outcome["tool_count"]),
+                  foxit_esign_live=result_is_live_esign,
+                  foxit_status=str(final_audit.get("foxit_folder_status") or ""),
+                  human_gate_state="VERIFIED",
+                  human_signature_verified=True,
+                  final_audit_state=str(final_audit.get("state") or ""),
+              )
+              DEMO_EVIDENCE_PATH.write_text(
+                  json.dumps(ui_evidence, indent=2, sort_keys=True), encoding="utf-8"
+              )
+              check(
+                  "demo evidence is displayable and carries no identity",
+                  demo_evidence.is_verified(ui_evidence),
+                  ", ".join(sorted(ui_evidence)),
+              )
+
               # ================= 12. Judge-facing summary =====================
               phase_two = [
                   "PHASE 2 — AFTER HUMAN APPROVAL",
@@ -832,6 +865,16 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      - name: Preserve the sanitized demo evidence
+        # Download this and commit it as demo-evidence.json to let the
+        # Streamlit UI report what this run observed.
+        uses: actions/upload-artifact@v4
+        with:
+          name: policygate-demo-evidence
+          path: ${{ runner.temp }}/demo-evidence.json
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Remove local Terraform, MCP and PDF artifacts
         if: always()
         run: |
@@ -840,7 +883,8 @@ jobs:
                  "${RUNNER_TEMP}/policygate-final-demo" \
                  "${RUNNER_TEMP}/foxit-mcp" \
                  "${RUNNER_TEMP}/pre-sign-audit.json" \
-                 "${RUNNER_TEMP}/final-audit.json"
+                 "${RUNNER_TEMP}/final-audit.json" \
+                 "${RUNNER_TEMP}/demo-evidence.json"
           find . -name 'tfplan' -o -name 'terraform.tfstate' -o -name 'terraform.tfstate.*' \
             | xargs -r rm -f
           echo "Local Terraform artifacts, MCP checkout and PDFs removed."
