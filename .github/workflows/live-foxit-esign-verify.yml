@@ -1,0 +1,435 @@
+name: Live Foxit eSign Verify
+
+# Manual only. This workflow verifies an envelope that was already sent and
+# already signed by a human. It is read-only against Foxit: it queries one
+# folder and downloads that folder's executed document.
+#
+# It never creates a folder, never sends an invitation, never signs, and never
+# runs Terraform or touches AWS. The verification itself is PolicyGate's own —
+# audit.finalize_from_foxit_folder() decides whether the signature counts.
+on:
+  workflow_dispatch:
+    inputs:
+      folder_id:
+        description: 'Foxit folder (envelope) ID from the send run.'
+        required: true
+      request_id:
+        description: 'PolicyGate request ID from the send run.'
+        required: true
+      expected_signer_email:
+        description: 'The approver the envelope was routed to.'
+        required: true
+      expected_unsigned_pdf_sha256:
+        description: 'SHA-256 of the approval PDF that was sent for signature.'
+        required: true
+      expected_terraform_plan_sha256:
+        description: 'SHA-256 of the approved Terraform plan file, if one was bound to the approval. Optional.'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-foxit-esign-verify-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  live-foxit-esign-verify:
+    name: Verify the executed Foxit envelope and finalize the audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      # Secrets: request headers only, never printed.
+      FOXIT_CLOUD_API_CLIENT_ID: ${{ secrets.FOXIT_CLOUD_API_CLIENT_ID }}
+      FOXIT_CLOUD_API_CLIENT_SECRET: ${{ secrets.FOXIT_CLOUD_API_CLIENT_SECRET }}
+      # The same host and transport the send workflow used.
+      FOXIT_ESIGN_TRANSPORT: developer_platform
+      FOXIT_ESIGN_BASE_URL: https://na1.fusion.foxit.com
+      POLICYGATE_FOLDER_ID: ${{ inputs.folder_id }}
+      POLICYGATE_REQUEST_ID: ${{ inputs.request_id }}
+      POLICYGATE_EXPECTED_SIGNER_EMAIL: ${{ inputs.expected_signer_email }}
+      POLICYGATE_EXPECTED_UNSIGNED_PDF_SHA256: ${{ inputs.expected_unsigned_pdf_sha256 }}
+      POLICYGATE_EXPECTED_TERRAFORM_PLAN_SHA256: ${{ inputs.expected_terraform_plan_sha256 }}
+      # Nothing here sends, signs or provisions.
+      POLICYGATE_FOXIT_SEND_NOW: "false"
+      POLICYGATE_EMBEDDED_SIGNING: "false"
+      POLICYGATE_INCLUDE_TERRAFORM_PLAN: "false"
+      POLICYGATE_ALLOW_APPLY: "false"
+      POLICYGATE_ALLOW_DESTROY: "false"
+      POLICYGATE_SUBMISSION_MODE: "false"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Verify credentials and inputs are present
+        run: |
+          set -euo pipefail
+          # Presence and shape tests only. No credential value is printed.
+          missing=0
+          if [ -z "${FOXIT_CLOUD_API_CLIENT_ID:-}" ]; then
+            echo "::error::Secret FOXIT_CLOUD_API_CLIENT_ID is not configured." >&2
+            missing=1
+          fi
+          if [ -z "${FOXIT_CLOUD_API_CLIENT_SECRET:-}" ]; then
+            echo "::error::Secret FOXIT_CLOUD_API_CLIENT_SECRET is not configured." >&2
+            missing=1
+          fi
+          for name in POLICYGATE_FOLDER_ID POLICYGATE_REQUEST_ID POLICYGATE_EXPECTED_SIGNER_EMAIL POLICYGATE_EXPECTED_UNSIGNED_PDF_SHA256; do
+            if [ -z "$(eval "printf '%s' \"\${${name}:-}\"")" ]; then
+              echo "::error::${name} is empty; all four identifying inputs are required." >&2
+              missing=1
+            fi
+          done
+          case "${POLICYGATE_EXPECTED_SIGNER_EMAIL:-}" in
+            *@*.*) ;;
+            *) echo "::error::expected_signer_email does not look like an email address." >&2; missing=1 ;;
+          esac
+          [ "$missing" -eq 0 ] || exit 1
+          echo "Foxit client id: present"
+          echo "Foxit client secret: present"
+          echo "Folder to verify: ${POLICYGATE_FOLDER_ID}"
+          echo "Request: ${POLICYGATE_REQUEST_ID}"
+          echo "Expected signer: ${POLICYGATE_EXPECTED_SIGNER_EMAIL}"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install locked dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -r requirements.lock
+
+      - name: Verify the executed envelope
+        run: |
+          set -euo pipefail
+          export AUDIT_PATH="${RUNNER_TEMP}/final-audit.json"
+          export SIGNED_PDF_PATH="${RUNNER_TEMP}/signed-approval.pdf"
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          from hashlib import sha256
+          from pathlib import Path
+
+          import requests
+
+          # PolicyGate's own completion path: the same client the send workflow
+          # used, and the same finalize_from_foxit_folder() that
+          # policygate.complete_approval calls. This job supplies inputs and
+          # assertions, not a second verification implementation.
+          import policygate.foxit_client as foxit_mod
+          import policygate.provisioning.terraform_runner as tf_runner
+          from policygate.audit import finalize_from_foxit_folder, write_audit_record
+          from policygate.foxit_client import FoxitESignClient
+
+          CLIENT_ID = os.environ.get("FOXIT_CLOUD_API_CLIENT_ID", "")
+          CLIENT_SECRET = os.environ.get("FOXIT_CLOUD_API_CLIENT_SECRET", "")
+          FOLDER_ID = (os.environ.get("POLICYGATE_FOLDER_ID") or "").strip()
+          REQUEST_ID = (os.environ.get("POLICYGATE_REQUEST_ID") or "").strip()
+          EXPECTED_SIGNER = (os.environ.get("POLICYGATE_EXPECTED_SIGNER_EMAIL") or "").strip()
+          EXPECTED_UNSIGNED_SHA = (
+              os.environ.get("POLICYGATE_EXPECTED_UNSIGNED_PDF_SHA256") or ""
+          ).strip().lower()
+          EXPECTED_PLAN_SHA = (
+              os.environ.get("POLICYGATE_EXPECTED_TERRAFORM_PLAN_SHA256") or ""
+          ).strip().lower() or None
+          AUDIT_PATH = Path(os.environ["AUDIT_PATH"])
+          SIGNED_PDF_PATH = Path(os.environ["SIGNED_PDF_PATH"])
+
+          if not (CLIENT_ID and CLIENT_SECRET and FOLDER_ID and REQUEST_ID and EXPECTED_SIGNER):
+              sys.exit("FAIL: Foxit credentials or verification inputs missing.")
+
+
+          def safe(text: object) -> str:
+              out = str(text)
+              for secret in (CLIENT_SECRET, CLIENT_ID):
+                  if secret:
+                      out = out.replace(secret, "***REDACTED***")
+              return out
+
+
+          def fail(message: str) -> None:
+              print(f"::error::{safe(message)}")
+              raise SystemExit(f"FAIL: {safe(message)}")
+
+
+          def check(label: str, ok: bool, detail: str) -> None:
+              print(f"  [{'PASS' if ok else 'FAIL'}] {label}: {safe(detail)}")
+              if not ok:
+                  fail(f"{label}: {detail}")
+
+
+          # --- Guards: nothing here may send, sign or provision. ---------------
+          def _createfolder_forbidden(*_args, **_kwargs):
+              raise RuntimeError(
+                  "This workflow verifies an existing envelope; it never creates one."
+              )
+
+
+          def _terraform_forbidden(*_args, **_kwargs):
+              raise RuntimeError("Terraform is not permitted in this workflow.")
+
+
+          foxit_mod.FoxitESignClient.create_human_approval_draft = _createfolder_forbidden
+          tf_runner._run = _terraform_forbidden
+          tf_runner.run_apply = _terraform_forbidden
+          tf_runner.run_destroy = _terraform_forbidden
+
+
+          # --- Observe every HTTP call the client makes. -----------------------
+          # Verification is read-only: only GETs should leave this job. A POST
+          # would mean something was created or sent.
+          class RecordingSession(requests.Session):
+              calls: list[tuple[str, str]] = []
+
+              def request(self, method, url, *args, **kwargs):  # type: ignore[override]
+                  RecordingSession.calls.append((method.upper(), url))
+                  return super().request(method, url, *args, **kwargs)
+
+
+          client = FoxitESignClient(session=RecordingSession())
+          if not client.configured:
+              fail("Foxit eSign client is not configured for the developer_platform transport.")
+
+          print("Input integrity")
+          check(
+              "expected unsigned PDF hash looks like SHA-256",
+              bool(re.fullmatch(r"[0-9a-f]{64}", EXPECTED_UNSIGNED_SHA)),
+              EXPECTED_UNSIGNED_SHA or "empty",
+          )
+          if EXPECTED_PLAN_SHA is not None:
+              check(
+                  "expected Terraform plan hash looks like SHA-256",
+                  bool(re.fullmatch(r"[0-9a-f]{64}", EXPECTED_PLAN_SHA)),
+                  EXPECTED_PLAN_SHA,
+              )
+          check(
+              "folder is a real Foxit folder",
+              not FOLDER_ID.upper().startswith("MOCK-"),
+              FOLDER_ID,
+          )
+
+          # The pre-sign record this verification is measured against. Same
+          # shape audit.build_pre_sign_audit() produces, rebuilt from the
+          # inputs carried out of the send run.
+          pre_sign = {
+              "request_id": REQUEST_ID,
+              "foxit_folder_id": FOLDER_ID,
+              "signer_email": EXPECTED_SIGNER,
+              "expected_signer_email": EXPECTED_SIGNER,
+              "verified_signer_email": None,
+              "unsigned_pdf_sha256": EXPECTED_UNSIGNED_SHA,
+              "terraform_plan_file_sha256": EXPECTED_PLAN_SHA,
+              "state": "AWAITING_HUMAN_APPROVAL",
+              "agent_may_sign": False,
+          }
+
+          signed_pdf_sha256 = ""
+          final: dict = {}
+          try:
+              # --- 1. Query the exact folder. ----------------------------------
+              print("\nFoxit folder")
+              try:
+                  folder_response = client.get_folder(FOLDER_ID)
+              except requests.RequestException as exc:
+                  fail(f"Foxit folder query failed: {exc}")
+              except Exception as exc:  # noqa: BLE001
+                  fail(f"Foxit folder query failed: {type(exc).__name__}: {exc}")
+
+              folder = folder_response.get("folder") or {}
+              returned_id = str(folder.get("folderId") or "")
+              status = str(folder.get("folderStatus") or "UNKNOWN").upper()
+              check("folder queried is the folder requested", returned_id == FOLDER_ID, returned_id or "no folderId returned")
+              check("folder status is EXECUTED", status == "EXECUTED", status)
+
+              # --- 2. Download that folder's executed document. ----------------
+              try:
+                  signed_pdf = client.download_document(FOLDER_ID, doc_number=1)
+              except requests.RequestException as exc:
+                  fail(f"Signed document download failed: {exc}")
+              except Exception as exc:  # noqa: BLE001
+                  fail(f"Signed document download failed: {type(exc).__name__}: {exc}")
+
+              SIGNED_PDF_PATH.write_bytes(signed_pdf)
+              on_disk = SIGNED_PDF_PATH.read_bytes()
+
+              print("\nSigned PDF")
+              check("signed PDF exists", SIGNED_PDF_PATH.is_file(), str(SIGNED_PDF_PATH))
+              check("signed PDF size > 0", len(on_disk) > 0, f"{len(on_disk)} bytes")
+              check("signed PDF magic bytes", on_disk[:4] == b"%PDF", repr(on_disk[:4]))
+              signed_pdf_sha256 = sha256(on_disk).hexdigest()
+              check("signed PDF SHA-256 computed", len(signed_pdf_sha256) == 64, signed_pdf_sha256)
+              check(
+                  "signed PDF differs from the document that was sent",
+                  signed_pdf_sha256 != EXPECTED_UNSIGNED_SHA,
+                  "the executed document is not byte-identical to the unsigned one",
+              )
+
+              # --- 3. PolicyGate decides whether the signature counts. ---------
+              # finalize_from_foxit_folder() re-checks the folder identity, the
+              # EXECUTED status and the expected signer, and refuses otherwise.
+              print("\nHuman signature verification")
+              try:
+                  final = finalize_from_foxit_folder(pre_sign, folder_response, on_disk)
+              except ValueError as exc:
+                  fail(f"PolicyGate refused to finalize this approval: {exc}")
+
+              verified_signer = str(final.get("verified_signer_email") or "")
+              check(
+                  "verified signer matches the expected approver",
+                  verified_signer.lower() == EXPECTED_SIGNER.lower(),
+                  f"expected={EXPECTED_SIGNER} verified={verified_signer}",
+              )
+              check("final audit state", final.get("state") == "APPROVED", str(final.get("state")))
+              check(
+                  "Foxit status recorded",
+                  final.get("foxit_folder_status") == "EXECUTED",
+                  str(final.get("foxit_folder_status")),
+              )
+              check(
+                  "agent did not sign",
+                  final.get("agent_may_sign") is False,
+                  "agent_may_sign=false",
+              )
+              check(
+                  "signed PDF hash bound into the audit",
+                  final.get("signed_pdf_sha256") == signed_pdf_sha256,
+                  signed_pdf_sha256,
+              )
+              check(
+                  "unsigned PDF hash preserved from the send run",
+                  final.get("unsigned_pdf_sha256") == EXPECTED_UNSIGNED_SHA,
+                  EXPECTED_UNSIGNED_SHA,
+              )
+              if EXPECTED_PLAN_SHA is not None:
+                  check(
+                      "approved Terraform plan hash preserved",
+                      final.get("terraform_plan_file_sha256") == EXPECTED_PLAN_SHA,
+                      EXPECTED_PLAN_SHA,
+                  )
+
+              # --- 4. Nothing was created, sent or signed. ---------------------
+              print("\nRead-only boundary")
+              writes = [call for call in RecordingSession.calls if call[0] != "GET"]
+              check("only read requests were made", not writes, ", ".join(f"{m} {u}" for m, u in writes) or "GET only")
+              check(
+                  "no createfolder call",
+                  not any("createfolder" in url for _, url in RecordingSession.calls),
+                  "no envelope was created",
+              )
+
+              # --- 5. Preserve the final audit. --------------------------------
+              write_audit_record(final, AUDIT_PATH)
+              preserved = json.loads(AUDIT_PATH.read_text(encoding="utf-8"))
+              serialized = json.dumps(preserved)
+              leaked = [v for v in (CLIENT_ID, CLIENT_SECRET) if v and v in serialized]
+              check("no credential in the preserved audit", not leaked, "credentials absent")
+              check(
+                  "no token or state key in the preserved audit",
+                  not any(
+                      key.lower().find(token) >= 0
+                      for key in preserved
+                      for token in ("token", "secret", "client_id", "tfstate")
+                  ),
+                  ", ".join(sorted(preserved)),
+              )
+
+              print("\nPreserved verification record")
+              for key in (
+                  "request_id",
+                  "foxit_folder_id",
+                  "expected_signer_email",
+                  "verified_signer_email",
+                  "unsigned_pdf_sha256",
+                  "terraform_plan_file_sha256",
+                  "signed_pdf_sha256",
+                  "foxit_folder_status",
+                  "state",
+              ):
+                  print(f"  {key}: {preserved.get(key)}")
+
+              summary = [
+                  "",
+                  "=" * 72,
+                  "Foxit eSign API: LIVE",
+                  f"Foxit folder status: {final.get('foxit_folder_status')}",
+                  f"Expected signer: {EXPECTED_SIGNER}",
+                  f"Verified signer: {verified_signer}",
+                  "Human signature: VERIFIED",
+                  "Agent signed: NO",
+                  f"Signed PDF SHA-256: {signed_pdf_sha256}",
+                  f"Final audit state: {final.get('state')}",
+                  "terraform apply: NOT RUN",
+                  "terraform destroy: NOT RUN",
+                  "=" * 72,
+              ]
+              print("\n".join(summary))
+
+              step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+              if step_summary:
+                  with open(step_summary, "a", encoding="utf-8") as fh:
+                      fh.write("### PolicyGate live Foxit eSign verification\n\n")
+                      fh.write("| Field | Value |\n| --- | --- |\n")
+                      fh.write("| Foxit eSign API | LIVE |\n")
+                      fh.write(f"| Foxit folder status | {final.get('foxit_folder_status')} |\n")
+                      fh.write(f"| Request ID | `{REQUEST_ID}` |\n")
+                      fh.write(f"| Folder ID | `{FOLDER_ID}` |\n")
+                      fh.write(f"| Expected signer | {EXPECTED_SIGNER} |\n")
+                      fh.write(f"| Verified signer | {verified_signer} |\n")
+                      fh.write("| Human signature | VERIFIED |\n")
+                      fh.write("| Agent signed | NO |\n")
+                      fh.write(f"| Unsigned PDF SHA-256 | `{EXPECTED_UNSIGNED_SHA}` |\n")
+                      if EXPECTED_PLAN_SHA is not None:
+                          fh.write(f"| Terraform plan SHA-256 | `{EXPECTED_PLAN_SHA}` |\n")
+                      fh.write(f"| Signed PDF SHA-256 | `{signed_pdf_sha256}` |\n")
+                      fh.write(f"| Final audit state | {final.get('state')} |\n")
+                      fh.write("| terraform apply | NOT RUN |\n")
+                      fh.write("| terraform destroy | NOT RUN |\n")
+          finally:
+              # The signed document never outlives the verification: not
+              # uploaded as an artifact, not committed, not left on the runner.
+              if SIGNED_PDF_PATH.exists():
+                  SIGNED_PDF_PATH.unlink()
+              print(f"\nSigned PDF deleted: {SIGNED_PDF_PATH}")
+
+          print(
+              "\nApproval verified against the same Foxit folder, EXECUTED status and "
+              "expected signer. A human signed; the agent did not."
+          )
+          PY
+
+      - name: Preserve the final audit record
+        uses: actions/upload-artifact@v4
+        with:
+          name: policygate-final-audit
+          # Non-secret verification metadata only. Neither the signed PDF nor
+          # any credential is uploaded.
+          path: ${{ runner.temp }}/final-audit.json
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Remove local files and verify the tree is clean
+        if: always()
+        run: |
+          set -euo pipefail
+          rm -f "${RUNNER_TEMP}/signed-approval.pdf" "${RUNNER_TEMP}/final-audit.json"
+          if [ -e "${RUNNER_TEMP}/signed-approval.pdf" ]; then
+            echo "::error::Signed PDF still present after cleanup." >&2
+            exit 1
+          fi
+          echo "Signed PDF removed from the runner."
+
+          dirty="$(git status --porcelain --untracked-files=all)"
+          if [ -n "${dirty}" ]; then
+            echo "::error::Working tree is not clean; the run left a file behind:" >&2
+            echo "${dirty}" >&2
+            exit 1
+          fi
+          echo "Working tree clean: no signed PDF or audit file was committed or staged."
