@@ -16,6 +16,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 import streamlit as st
 
+from policygate import demo_evidence
 from policygate.runtime_status import get_runtime_status
 from policygate.schema import WorkflowState
 from policygate.workflow import run_workflow
@@ -44,17 +45,64 @@ st.title("🛡️ PolicyGate AI")
 st.caption("AI can propose. Policy can validate. Only a human can authorize.")
 
 runtime = get_runtime_status()
-cols = st.columns(5)
-with cols[0]:
-    _status_box("Claude", runtime.claude)
-with cols[1]:
-    _status_box("Foxit eSign", runtime.foxit_esign)
-with cols[2]:
-    _status_box("Foxit MCP", runtime.foxit_mcp)
-with cols[3]:
-    _status_box("Terraform", runtime.terraform_plan)
-with cols[4]:
-    _status_box("Submission mode", "LIVE-ONLY" if runtime.submission_mode else "OFF")
+
+# Badges come from evidence a final run actually produced, never from this
+# process asserting anything about itself. With no verified evidence present,
+# the honest local labels below stand.
+try:
+    _evidence = demo_evidence.load()
+except demo_evidence.UnsafeEvidence as exc:
+    _evidence = None
+    st.error(f"Demo evidence rejected as unsafe to display: {exc}")
+_badges = demo_evidence.badges(_evidence)
+
+if _badges:
+    st.success(
+        "Showing verified evidence from a completed end-to-end run "
+        "(final-policygate-demo.yml). These labels report what that run "
+        "observed; this app asserts nothing about itself."
+    )
+    badge_cols = st.columns(len(_badges))
+    for _col, (_label, _value) in zip(badge_cols, _badges.items()):
+        with _col:
+            _status_box(_label, _value, live_prefixes=("LIVE", "PASS", "VERIFIED"))
+else:
+    cols = st.columns(5)
+    with cols[0]:
+        _status_box("Claude", runtime.claude)
+    with cols[1]:
+        _status_box("Foxit eSign", runtime.foxit_esign)
+    with cols[2]:
+        _status_box("Foxit MCP", runtime.foxit_mcp)
+    with cols[3]:
+        _status_box("Terraform", runtime.terraform_plan)
+    with cols[4]:
+        _status_box("Submission mode", "LIVE-ONLY" if runtime.submission_mode else "OFF")
+    if _evidence:
+        st.info(
+            "Demo evidence is present but does not describe a verified human "
+            "signature, so the local runtime status is shown instead."
+        )
+
+if _evidence:
+    with st.expander("Evidence from the verified end-to-end run", expanded=bool(_badges)):
+        _tf_cols = st.columns(3)
+        _tf_cols[0].metric("Resources to add", _evidence.get("terraform_resources_added", "—"))
+        _tf_cols[1].metric("Resources to change", _evidence.get("terraform_resources_changed", "—"))
+        _tf_cols[2].metric("Resources to destroy", _evidence.get("terraform_resources_destroyed", "—"))
+        if _evidence.get("terraform_plan_summary"):
+            st.code(_evidence["terraform_plan_summary"], language="text")
+        if _evidence.get("terraform_plan_sha256"):
+            st.write("**Terraform plan file SHA-256**")
+            st.code(_evidence["terraform_plan_sha256"], language="text")
+            st.caption(
+                "The hash of the exact saved plan file, bound into the approval "
+                "document before a human signed it."
+            )
+        _audit_cols = st.columns(3)
+        _audit_cols[0].write(f"**Foxit status**\n\n{_evidence.get('foxit_status', '—')}")
+        _audit_cols[1].write(f"**Human gate**\n\n{_evidence.get('human_gate_state', '—')}")
+        _audit_cols[2].write(f"**Final audit**\n\n{_evidence.get('final_audit_state', '—')}")
 
 if runtime.submission_mode:
     st.info("Submission mode is fail-closed: AI fallback, missing Foxit MCP/eSign credentials, ambiguous signing routes, or a disabled Terraform plan will stop the run.")
