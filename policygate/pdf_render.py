@@ -14,6 +14,8 @@ from reportlab.lib.enums import TA_LEFT
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak, Preformatted
 from reportlab.lib import colors
 
+from .schema import WorkflowState
+
 
 def render_evidence_pdf(evidence: dict) -> bytes:
     buf = BytesIO()
@@ -115,6 +117,14 @@ def render_evidence_pdf(evidence: dict) -> bytes:
             Paragraph("Human approval", styles["Heading2"]),
             Paragraph(
                 "This document is not an authorization until a human approver signs it in Foxit eSign.",
+                styles["Normal"],
+            ),
+            Spacer(1, 6),
+            # The document should say, in as many words, where the agent
+            # stopped. A reader should not have to infer it.
+            Paragraph(
+                f"<b>Workflow state:</b> {WorkflowState.AWAITING_HUMAN_APPROVAL.value} "
+                "— the agent halted here and cannot sign, approve, or provision.",
                 styles["Normal"],
             ),
             Spacer(1, 12),

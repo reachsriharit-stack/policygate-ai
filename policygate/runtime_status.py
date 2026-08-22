@@ -18,16 +18,27 @@ def _truthy(name: str) -> bool:
     return os.getenv(name, "false").lower() == "true"
 
 
+def _esign_configured() -> bool:
+    """Credentials for the transport foxit_client will actually use.
+
+    The Developer Platform transport authenticates with the FOXIT_CLOUD_API_*
+    credentials, so checking only the portal's FOXIT_ESIGN_* pair would call a
+    fully live gateway setup 'mock' — and would call a portal-only setup live
+    even when the gateway transport is selected.
+    """
+    if os.getenv("FOXIT_ESIGN_TRANSPORT", "esign_oauth").strip().lower() == "developer_platform":
+        return bool(
+            os.getenv("FOXIT_CLOUD_API_CLIENT_ID") and os.getenv("FOXIT_CLOUD_API_CLIENT_SECRET")
+        )
+    return bool(os.getenv("FOXIT_ESIGN_CLIENT_ID") and os.getenv("FOXIT_ESIGN_CLIENT_SECRET"))
+
+
 def get_runtime_status(include_terraform_plan: bool | None = None) -> RuntimeStatus:
     if os.getenv("ANTHROPIC_API_KEY"):
         claude = "LIVE (fallback enabled)" if _truthy("POLICYGATE_ALLOW_AI_FALLBACK") else "LIVE"
     else:
         claude = "OFFLINE PARSER"
-    foxit_esign = (
-        "LIVE"
-        if os.getenv("FOXIT_ESIGN_CLIENT_ID") and os.getenv("FOXIT_ESIGN_CLIENT_SECRET")
-        else "MOCK"
-    )
+    foxit_esign = "LIVE" if _esign_configured() else "MOCK"
     foxit_mcp = (
         "CONFIGURED (external MCP host)"
         if os.getenv("FOXIT_CLOUD_API_CLIENT_ID") and os.getenv("FOXIT_CLOUD_API_CLIENT_SECRET")
@@ -55,7 +66,7 @@ def enforce_submission_mode(include_terraform_plan: bool) -> None:
         missing.append("ANTHROPIC_API_KEY (live Claude)")
     if _truthy("POLICYGATE_ALLOW_AI_FALLBACK"):
         missing.append("POLICYGATE_ALLOW_AI_FALLBACK=false")
-    if not (os.getenv("FOXIT_ESIGN_CLIENT_ID") and os.getenv("FOXIT_ESIGN_CLIENT_SECRET")):
+    if not _esign_configured():
         missing.append("Foxit eSign credentials")
     if not (os.getenv("FOXIT_CLOUD_API_CLIENT_ID") and os.getenv("FOXIT_CLOUD_API_CLIENT_SECRET")):
         missing.append("Foxit PDF/MCP credentials")

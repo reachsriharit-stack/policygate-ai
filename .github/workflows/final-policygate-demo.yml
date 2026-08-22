@@ -1,0 +1,707 @@
+name: PolicyGate AI — Final Demo
+
+# Manual only. This is the full submission run: real Claude, real AWS Terraform
+# plan through OIDC, real Foxit MCP, real Foxit eSign handoff — and a hard stop
+# at AWAITING_HUMAN_APPROVAL.
+#
+# It never signs, never runs terraform apply or destroy, and never provisions
+# anything. Every integration below is the one already proven by its own
+# workflow; this one runs them in a single evidence chain.
+on:
+  workflow_dispatch:
+    inputs:
+      signer_first_name:
+        description: 'First name of the human approver.'
+        required: true
+      signer_last_name:
+        description: 'Last name of the human approver.'
+        required: true
+      signer_email:
+        description: 'Email address that will receive the Foxit signing invitation.'
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: final-policygate-demo-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Official server: https://github.com/foxitsoftware/foxit-pdf-api-mcp-server
+  FOXIT_MCP_REPO: https://github.com/foxitsoftware/foxit-pdf-api-mcp-server.git
+  FOXIT_MCP_SHA: db16f9d0f18b878a07f41621e708dbb78bc13e4c
+  FOXIT_MCP_PACKAGE_PATH: python/foxit-pdf-api-mcp-server
+
+jobs:
+  final-demo:
+    name: Claude → guardrails → Terraform plan → PDF → Foxit MCP → eSign → STOP
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      # --- Live Claude ---------------------------------------------------
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      CLAUDE_MODEL: claude-sonnet-5
+      POLICYGATE_ALLOW_AI_FALLBACK: "false"
+      # --- Live Foxit (PDF Services / MCP and eSign share these) ---------
+      FOXIT_CLOUD_API_CLIENT_ID: ${{ secrets.FOXIT_CLOUD_API_CLIENT_ID }}
+      FOXIT_CLOUD_API_CLIENT_SECRET: ${{ secrets.FOXIT_CLOUD_API_CLIENT_SECRET }}
+      FOXIT_CLOUD_API_HOST: ${{ vars.FOXIT_CLOUD_API_HOST }}
+      FOXIT_ESIGN_TRANSPORT: developer_platform
+      FOXIT_ESIGN_BASE_URL: https://na1.fusion.foxit.com
+      # --- Human approver, from the dispatch inputs ----------------------
+      POLICYGATE_SIGNER_FIRST_NAME: ${{ inputs.signer_first_name }}
+      POLICYGATE_SIGNER_LAST_NAME: ${{ inputs.signer_last_name }}
+      POLICYGATE_SIGNER_EMAIL: ${{ inputs.signer_email }}
+      # --- Submission mode: fail closed if anything is secretly a mock ---
+      POLICYGATE_SUBMISSION_MODE: "true"
+      POLICYGATE_INCLUDE_TERRAFORM_PLAN: "true"
+      POLICYGATE_FOXIT_SEND_NOW: "true"
+      POLICYGATE_EMBEDDED_SIGNING: "false"
+      # --- The two gates that stay shut ----------------------------------
+      POLICYGATE_ALLOW_APPLY: "false"
+      POLICYGATE_ALLOW_DESTROY: "false"
+      # --- AWS / Terraform ------------------------------------------------
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      TF_IN_AUTOMATION: "true"
+      TF_INPUT: "0"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Verify every live integration is configured
+        env:
+          AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+        run: |
+          set -euo pipefail
+          # Presence tests only. No secret value is printed or transformed.
+          missing=0
+          require_secret () {
+            if [ -z "$(eval "printf '%s' \"\${$1:-}\"")" ]; then
+              echo "::error::$1 is not configured." >&2
+              missing=1
+            else
+              echo "  $2: present"
+            fi
+          }
+          require_secret ANTHROPIC_API_KEY "Anthropic API key"
+          require_secret FOXIT_CLOUD_API_CLIENT_ID "Foxit client id"
+          require_secret FOXIT_CLOUD_API_CLIENT_SECRET "Foxit client secret"
+          require_secret FOXIT_CLOUD_API_HOST "Foxit PDF Services host"
+          require_secret AWS_ROLE_ARN "AWS role ARN"
+          require_secret AWS_REGION "AWS region"
+          require_secret POLICYGATE_SIGNER_EMAIL "Human approver email"
+          case "${POLICYGATE_SIGNER_EMAIL:-}" in
+            *@*.*) ;;
+            *) echo "::error::signer_email does not look like an email address." >&2; missing=1 ;;
+          esac
+          [ "$missing" -eq 0 ] || exit 1
+          echo "Human approver: ${POLICYGATE_SIGNER_FIRST_NAME} ${POLICYGATE_SIGNER_LAST_NAME} <${POLICYGATE_SIGNER_EMAIL}>"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install PolicyGate dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -r requirements.lock
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: 1.14.9
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials via GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@v6.2.3
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: policygate-final-demo
+          role-duration-seconds: 3600
+
+      - name: Report assumed AWS identity
+        run: |
+          set -euo pipefail
+          # Identity metadata only; get-caller-identity never returns credentials.
+          echo "AWS account: $(aws sts get-caller-identity --query 'Account' --output text)"
+          echo "Assumed ARN: $(aws sts get-caller-identity --query 'Arn' --output text)"
+          echo "AWS region:  ${AWS_REGION}"
+
+      - name: Record Terraform version
+        run: |
+          set -euo pipefail
+          terraform_version="$(terraform version -json | python -c 'import json,sys; print(json.load(sys.stdin)["terraform_version"])')"
+          echo "Terraform v${terraform_version}"
+          echo "POLICYGATE_TF_VERSION=${terraform_version}" >> "$GITHUB_ENV"
+
+      - name: Install the official Foxit MCP server at the pinned commit
+        run: |
+          set -euo pipefail
+          checkout="${RUNNER_TEMP}/foxit-mcp"
+          rm -rf "${checkout}"
+          git clone --quiet --no-checkout "${FOXIT_MCP_REPO}" "${checkout}"
+          git -C "${checkout}" checkout --quiet "${FOXIT_MCP_SHA}"
+          head="$(git -C "${checkout}" rev-parse HEAD)"
+          if [ "${head}" != "${FOXIT_MCP_SHA}" ]; then
+            echo "::error::Checked out ${head}, expected the pinned ${FOXIT_MCP_SHA}." >&2
+            exit 1
+          fi
+          if [ ! -f "${checkout}/${FOXIT_MCP_PACKAGE_PATH}/pyproject.toml" ]; then
+            echo "::error::Expected the current Python server at ${FOXIT_MCP_PACKAGE_PATH}." >&2
+            exit 1
+          fi
+          pip install "${checkout}/${FOXIT_MCP_PACKAGE_PATH}"
+          echo "Foxit MCP server pinned at ${head}"
+
+      - name: Run the full PolicyGate evidence chain
+        run: |
+          set -euo pipefail
+          export AUDIT_PATH="${RUNNER_TEMP}/pre-sign-audit.json"
+          export DEMO_WORKDIR="${RUNNER_TEMP}/policygate-final-demo"
+          python - <<'PY'
+          import asyncio
+          import base64
+          import json
+          import os
+          import re
+          import sys
+          import zlib
+          from hashlib import sha256
+          from pathlib import Path
+
+          import requests
+          from mcp import ClientSession, StdioServerParameters
+          from mcp.client.stdio import stdio_client
+
+          # Every step below is existing PolicyGate code. This job composes them
+          # in one chain — parse -> policy -> terraform -> PDF -> MCP -> eSign
+          # -> audit — because the document routed for signature has to be the
+          # MCP-processed one, which workflow.run_workflow() has no hook for.
+          import policygate.parser as parser_mod
+          import policygate.provisioning.terraform_runner as tf_runner
+          from policygate.audit import build_pre_sign_audit
+          from policygate.evidence import build_evidence_packet
+          from policygate.foxit_client import FoxitESignClient
+          from policygate.parser import parse
+          from policygate.pdf_render import render_evidence_pdf
+          from policygate.planner import build_plan
+          from policygate.provisioning.approval_gate import (
+              ProvisioningNotAuthorized,
+              authorize_provisioning,
+          )
+          from policygate.provisioning.plan_binding import generate_and_plan
+          from policygate.rules import evaluate
+          from policygate.runtime_status import enforce_submission_mode, get_runtime_status
+          from policygate.schema import WorkflowState
+
+          REQUEST = (
+              "Provision production PostgreSQL on AWS in us-east-1. "
+              "High availability required, 30-day backups, "
+              "maximum budget $900 per month."
+          )
+          MCP_SERVER = "foxitsoftware/foxit-pdf-api-mcp-server"
+          MCP_TOOL = "pdf_compress"
+          COMPRESSION_LEVEL = "MEDIUM"
+          REQUIRED_MCP_TOOLS = ("upload_document", MCP_TOOL, "download_document")
+
+          CLIENT_ID = os.environ.get("FOXIT_CLOUD_API_CLIENT_ID", "")
+          CLIENT_SECRET = os.environ.get("FOXIT_CLOUD_API_CLIENT_SECRET", "")
+          ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+          FIRST_NAME = (os.environ.get("POLICYGATE_SIGNER_FIRST_NAME") or "").strip()
+          LAST_NAME = (os.environ.get("POLICYGATE_SIGNER_LAST_NAME") or "").strip()
+          SIGNER_EMAIL = (os.environ.get("POLICYGATE_SIGNER_EMAIL") or "").strip()
+          SIGNER_NAME = " ".join(p for p in (FIRST_NAME, LAST_NAME) if p) or "Human Approver"
+
+          workdir = Path(os.environ["DEMO_WORKDIR"])
+          workdir.mkdir(parents=True, exist_ok=True)
+          rendered_pdf_path = workdir / "policygate-change-approval.pdf"
+          mcp_pdf_path = workdir / "policygate-change-approval-mcp.pdf"
+          mcp_log = workdir / "mcp-server-stderr.log"
+          AUDIT_PATH = Path(os.environ["AUDIT_PATH"])
+
+
+          def safe(text: object) -> str:
+              out = str(text)
+              for secret in (CLIENT_SECRET, CLIENT_ID, ANTHROPIC_KEY):
+                  if secret:
+                      out = out.replace(secret, "***REDACTED***")
+              return out
+
+
+          def fail(message: str) -> None:
+              print(f"::error::{safe(message)}")
+              raise SystemExit(f"FAIL: {safe(message)}")
+
+
+          def check(label: str, ok: bool, detail: str) -> None:
+              print(f"  [{'PASS' if ok else 'FAIL'}] {label}: {safe(detail)}")
+              if not ok:
+                  fail(f"{label}: {detail}")
+
+
+          # ================= 0. Fail closed before anything runs ==============
+          # Submission mode refuses to proceed if any live integration is
+          # missing or a mock path could be taken.
+          try:
+              enforce_submission_mode(True)
+          except RuntimeError as exc:
+              fail(f"Submission mode refused this run: {exc}")
+
+          status = get_runtime_status(True)
+          print("Runtime status")
+          check("Claude", status.claude == "LIVE", status.claude)
+          check("Foxit eSign", status.foxit_esign == "LIVE", status.foxit_esign)
+          check("Foxit PDF/MCP", status.foxit_mcp.startswith("CONFIGURED"), status.foxit_mcp)
+          check("Terraform plan", status.terraform_plan == "LIVE PLAN", status.terraform_plan)
+          check("Submission mode", status.submission_mode is True, str(status.submission_mode))
+
+          # ================= Guards ===========================================
+          # The offline parser must never run: it would turn a "live Claude"
+          # claim into a heuristic regex match.
+          def _offline_forbidden(*_args, **_kwargs):
+              raise RuntimeError(
+                  "Offline parser fallback was invoked; this demo requires the live Claude parser."
+              )
+
+
+          parser_mod.parse_offline = _offline_forbidden
+
+          live_calls = {"count": 0}
+          _real_parse_with_claude = parser_mod.parse_with_claude
+
+
+          def _tracked_parse_with_claude(nl_request, requested_by):
+              live_calls["count"] += 1
+              return _real_parse_with_claude(nl_request, requested_by)
+
+
+          parser_mod.parse_with_claude = _tracked_parse_with_claude
+
+          # Every terraform subprocess funnels through _run; apply and destroy
+          # raise before a command line can be built.
+          executed_terraform: list[list[str]] = []
+          _real_run = tf_runner._run
+
+
+          def _tracked_run(wd, args):
+              executed_terraform.append(list(args))
+              if args and args[0] in {"apply", "destroy"}:
+                  raise RuntimeError(f"terraform {args[0]} is not permitted in this workflow")
+              return _real_run(wd, args)
+
+
+          def _mutation_forbidden(*_args, **_kwargs):
+              raise RuntimeError("terraform apply/destroy is not permitted in this workflow")
+
+
+          tf_runner._run = _tracked_run
+          tf_runner.run_apply = _mutation_forbidden
+          tf_runner.run_destroy = _mutation_forbidden
+
+          try:
+              # ================= 1. Live Claude ===============================
+              print("\n1. Claude intent extraction (live API)")
+              request = parse(REQUEST, requested_by="PolicyGate final demo")
+              check("live Claude parser used", live_calls["count"] == 1, f"parse_with_claude calls={live_calls['count']}")
+              check("model", bool(os.getenv("CLAUDE_MODEL")), str(os.getenv("CLAUDE_MODEL")))
+              check("AI fallback disabled", os.getenv("POLICYGATE_ALLOW_AI_FALLBACK") == "false", "POLICYGATE_ALLOW_AI_FALLBACK=false")
+
+              # The named human approver comes from the dispatch inputs.
+              request.approver_name = SIGNER_NAME
+              request.approver_email = SIGNER_EMAIL
+
+              # ================= 2. Deterministic guardrails ==================
+              print("\n2. Deterministic guardrails")
+              plan = build_plan(request)
+              policy_result = evaluate(request, plan)
+              for rule in policy_result.checks:
+                  check(rule.code, rule.passed, f"{rule.description} (actual={rule.actual}; expected={rule.expected})")
+              check("every production guardrail passed", policy_result.passed, str(policy_result.passed))
+
+              print("\n   Approved configuration")
+              print(f"     Region:            {plan.region}")
+              print(f"     Encryption:        {plan.encryption_at_rest}")
+              print(f"     High availability: {plan.high_availability}")
+              print(f"     Backup retention:  {plan.backup_retention_days} days")
+              print(f"     Public exposure:   {plan.public_access}")
+              print(
+                  f"     Budget:            ${plan.estimated_monthly_cost_usd:,.0f}/mo estimated"
+                  f" against ${float(request.monthly_budget_usd or 0):,.0f}/mo requested"
+              )
+              print(f"     Named approver:    {SIGNER_NAME}")
+              print(f"     Approver email:    {SIGNER_EMAIL}")
+
+              # ================= 3. Real AWS-backed Terraform plan ============
+              print("\n3. Terraform plan against the real AWS provider")
+              evidence = build_evidence_packet(policy_result)
+              terraform_workdir = Path("terraform") / request.request_id
+              terraform_plan = generate_and_plan(evidence, terraform_workdir)
+
+              verbs = [cmd[0] for cmd in executed_terraform if cmd]
+              for verb in ("init", "validate", "plan", "show"):
+                  check(f"terraform {verb} ran", verb in verbs, " ".join(verbs))
+              check("terraform apply NOT run", "apply" not in verbs, "no apply command was issued")
+              check("terraform destroy NOT run", "destroy" not in verbs, "no destroy command was issued")
+
+              plan_file = terraform_workdir / "tfplan"
+              check("tfplan exists", plan_file.is_file(), str(plan_file))
+              # Hashed straight from the saved binary plan file.
+              tfplan_sha256 = sha256(plan_file.read_bytes()).hexdigest()
+              check("tfplan SHA-256 is 64 characters", len(tfplan_sha256) == 64, tfplan_sha256)
+              check(
+                  "hash matches PolicyGate's own plan-file hash",
+                  tfplan_sha256 == tf_runner.hash_plan_file(terraform_workdir),
+                  "identical",
+              )
+              check(
+                  "no terraform state written",
+                  not list(terraform_workdir.glob("terraform.tfstate*")),
+                  "terraform.tfstate absent",
+              )
+
+              evidence = build_evidence_packet(policy_result, terraform_plan=terraform_plan)
+              check(
+                  "evidence carries the same tfplan hash",
+                  (evidence.get("terraform_plan") or {}).get("plan_file_sha256") == tfplan_sha256,
+                  tfplan_sha256,
+              )
+
+              plan_summary = (terraform_plan.get("plan_summary") or "").strip()
+              counts = re.search(
+                  r"Plan:\s+(\d+)\s+to add,\s+(\d+)\s+to change,\s+(\d+)\s+to destroy",
+                  plan_summary,
+              )
+              if counts:
+                  add, change, destroy = counts.groups()
+              elif "No changes" in plan_summary:
+                  add = change = destroy = "0"
+              else:
+                  add = change = destroy = "unknown"
+                  fail("Could not read add/change/destroy counts from terraform show output.")
+              check("resource counts parsed", True, f"{add} to add, {change} to change, {destroy} to destroy")
+
+              # ================= 4. Approval PDF ==============================
+              print("\n4. Change Approval Document")
+              rendered_pdf = render_evidence_pdf(evidence)
+              rendered_pdf_path.write_bytes(rendered_pdf)
+              check("PDF begins with %PDF", rendered_pdf[:4] == b"%PDF", repr(rendered_pdf[:4]))
+              unsigned_pdf_sha256 = sha256(rendered_pdf).hexdigest()
+              check("unsigned PDF SHA-256 computed", len(unsigned_pdf_sha256) == 64, unsigned_pdf_sha256)
+
+              def pdf_text(raw: bytes) -> str:
+                  out = ""
+                  for match in re.finditer(rb"stream\n(.*?)endstream", raw, re.S):
+                      try:
+                          out += zlib.decompress(
+                              base64.a85decode(match.group(1).strip(), adobe=True)
+                          ).decode("latin-1")
+                      except Exception:
+                          continue
+                  return out
+
+              # The document a human signs must actually show what they are
+              # approving, so this reads the rendered text back.
+              text = pdf_text(rendered_pdf)
+              for label, needle in (
+                  ("request ID", request.request_id),
+                  ("human approver", FIRST_NAME),
+                  ("approver email", SIGNER_EMAIL),
+                  ("deterministic policy results", "Deterministic policy checks"),
+                  ("RDS configuration", "Instance Class"),
+                  ("database engine", "postgresql"),
+                  ("Terraform plan summary", "Terraform plan"),
+                  ("resource counts", f"{add} to add"),
+                  ("tfplan SHA-256", tfplan_sha256),
+                  ("human approval boundary", "not an authorization until a human approver signs"),
+                  ("workflow state", WorkflowState.AWAITING_HUMAN_APPROVAL.value),
+              ):
+                  check(f"PDF shows {label}", needle in text, "visible in the document")
+
+              # ================= 5. Foxit MCP =================================
+              print("\n5. Foxit MCP PDF operation (official server over stdio)")
+              LAUNCH = (
+                  "from foxit_pdf_api_mcp_server.server import mcp; "
+                  'mcp.run(transport="stdio")'
+              )
+              host = (os.environ.get("FOXIT_CLOUD_API_HOST") or "").strip().rstrip("/")
+              if not host.endswith("/pdf-services"):
+                  host = f"{host}/pdf-services"
+              mcp_params = StdioServerParameters(
+                  command=sys.executable,
+                  args=["-c", LAUNCH],
+                  env={
+                      "PATH": os.environ.get("PATH", ""),
+                      "HOME": os.environ.get("HOME", ""),
+                      "PYTHONUNBUFFERED": "1",
+                      "FOXIT_CLOUD_API_CLIENT_ID": CLIENT_ID,
+                      "FOXIT_CLOUD_API_CLIENT_SECRET": CLIENT_SECRET,
+                      "FOXIT_CLOUD_API_BASE_URL": host,
+                      "FOXIT_CLOUD_API_HOST": host,
+                  },
+                  cwd=str(workdir),
+              )
+
+              def mcp_payload(result, tool_name: str) -> dict:
+                  """Foxit MCP tools report failure inside their JSON payload
+                  rather than as a protocol error."""
+                  if getattr(result, "isError", False):
+                      fail(f"MCP call to {tool_name} returned a protocol error: {result}")
+                  blocks = [b for b in (result.content or []) if getattr(b, "text", None)]
+                  if not blocks:
+                      fail(f"MCP call to {tool_name} returned no text content")
+                  try:
+                      payload = json.loads(blocks[0].text)
+                  except ValueError:
+                      fail(f"{tool_name} did not return JSON: {blocks[0].text[:400]}")
+                  if not isinstance(payload, dict) or not payload.get("success"):
+                      fail(f"{tool_name} failed: {json.dumps(payload)[:600]}")
+                  return payload
+
+              async def run_mcp() -> dict:
+                  with mcp_log.open("w", encoding="utf-8") as errlog:
+                      async with stdio_client(mcp_params, errlog=errlog) as (read, write):
+                          async with ClientSession(read, write) as session:
+                              init = await session.initialize()
+                              server_name = getattr(init.serverInfo, "name", "")
+                              check("official MCP server started", bool(server_name), server_name)
+
+                              listed = await session.list_tools()
+                              names = sorted(tool.name for tool in listed.tools)
+                              check("tool discovery succeeded", bool(names), f"{len(names)} tools")
+                              for wanted in REQUIRED_MCP_TOOLS:
+                                  check(f"tool registered: {wanted}", wanted in names, "present")
+
+                              uploaded = mcp_payload(
+                                  await session.call_tool(
+                                      "upload_document",
+                                      {"resourceUri": f"file://{rendered_pdf_path}"},
+                                  ),
+                                  "upload_document",
+                              )
+                              document_id = str(uploaded.get("documentId") or "")
+                              check("document uploaded through MCP", bool(document_id), document_id)
+
+                              operated = mcp_payload(
+                                  await session.call_tool(
+                                      MCP_TOOL,
+                                      {"documentId": document_id, "compressionLevel": COMPRESSION_LEVEL},
+                                  ),
+                                  MCP_TOOL,
+                              )
+                              result_document_id = str(operated.get("resultDocumentId") or "")
+                              check(f"real MCP tool invoked: {MCP_TOOL}", bool(result_document_id), result_document_id)
+                              check(
+                                  "Foxit produced a new document",
+                                  result_document_id and result_document_id != document_id,
+                                  f"input={document_id} result={result_document_id}",
+                              )
+
+                              downloaded = mcp_payload(
+                                  await session.call_tool(
+                                      "download_document",
+                                      {"documentId": result_document_id, "outputPath": str(mcp_pdf_path)},
+                                  ),
+                                  "download_document",
+                              )
+                              check(
+                                  "processed document retrieved",
+                                  int(downloaded.get("size") or 0) > 0,
+                                  f"{downloaded.get('size')} bytes",
+                              )
+                              return {"tool_count": len(names)}
+
+              mcp_outcome = asyncio.run(run_mcp())
+              mcp_pdf = mcp_pdf_path.read_bytes() if mcp_pdf_path.is_file() else b""
+              check("MCP output PDF exists", mcp_pdf_path.is_file(), str(mcp_pdf_path))
+              check("MCP output begins with %PDF", mcp_pdf[:4] == b"%PDF", repr(mcp_pdf[:4]))
+              mcp_pdf_sha256 = sha256(mcp_pdf).hexdigest()
+              check("MCP output PDF SHA-256 computed", len(mcp_pdf_sha256) == 64, mcp_pdf_sha256)
+
+              # ================= 6. Foxit eSign human handoff =================
+              print("\n6. Foxit eSign handoff")
+
+              class RecordingSession(requests.Session):
+                  calls: list[dict] = []
+
+                  def post(self, url, **kwargs):  # type: ignore[override]
+                      RecordingSession.calls.append(
+                          {"url": url, "json": kwargs.get("json"), "headers": sorted((kwargs.get("headers") or {}).keys())}
+                      )
+                      return super().post(url, **kwargs)
+
+              client = FoxitESignClient(session=RecordingSession())
+              check("eSign client is live", client.configured, f"transport={client.transport}")
+              handoff = client.create_human_approval_draft(
+                  pdf_bytes=mcp_pdf,
+                  signer_name=SIGNER_NAME,
+                  signer_email=SIGNER_EMAIL,
+                  request_id=request.request_id,
+                  create_embedded_session=False,
+                  send_now=True,
+              )
+
+              posts = [c for c in RecordingSession.calls if "createfolder" in c["url"]]
+              if not posts:
+                  fail("No createfolder request was observed; nothing was routed.")
+              sent = posts[-1]["json"] or {}
+              parties = sent.get("parties") or []
+              check("sendNow was true", sent.get("sendNow") is True, str(sent.get("sendNow")))
+              check("exactly one signing party", len(parties) == 1, f"{len(parties)} parties")
+              check(
+                  "the named approver is the signing party",
+                  parties and parties[0].get("emailId") == SIGNER_EMAIL,
+                  SIGNER_EMAIL,
+              )
+              check(
+                  "the routed document is the MCP output",
+                  (sent.get("base64FileString") or [""])[0] == base64.b64encode(mcp_pdf).decode("ascii"),
+                  "MCP-processed PDF was sent for signature",
+              )
+              for forbidden in (
+                  "createExecutedFolder",
+                  "signNow",
+                  "signature",
+                  "savedSignature",
+                  "useSavedSignature",
+                  "createEmbeddedSigningSession",
+              ):
+                  check(f"no {forbidden}", forbidden not in sent, "absent from the request")
+              folder_id = str(handoff.folder_id or "")
+              check(
+                  "Foxit folder ID captured",
+                  bool(folder_id) and folder_id.lower() != "unknown",
+                  folder_id or "none returned",
+              )
+              check("live Foxit handoff", handoff.mock is False, handoff.provider)
+
+              # ================= 7. Human approval boundary ===================
+              print("\n7. Human approval boundary")
+              audit = build_pre_sign_audit(evidence, rendered_pdf, handoff)
+              state = WorkflowState.AWAITING_HUMAN_APPROVAL
+              check("workflow state", audit.get("state") == state.value, str(audit.get("state")))
+              check("agent may not sign", audit.get("agent_may_sign") is False, "agent_may_sign=false")
+              check("no verified signer", not audit.get("verified_signer_email"), "verified_signer_email is empty")
+              check("audit is not APPROVED", audit.get("state") != "APPROVED", "no approval recorded")
+              check(
+                  "terraform plan hash bound into the audit",
+                  audit.get("terraform_plan_file_sha256") == tfplan_sha256,
+                  tfplan_sha256,
+              )
+              try:
+                  authorize_provisioning(audit, evidence)
+              except ProvisioningNotAuthorized as exc:
+                  check("provisioning denied before signature", True, str(exc).split(".")[0])
+              else:
+                  fail("authorize_provisioning() allowed provisioning before any human signed.")
+
+              # ================= 8. Preserve safe metadata ====================
+              preserved = {
+                  "request_id": audit["request_id"],
+                  "foxit_folder_id": folder_id,
+                  "expected_signer_email": audit["expected_signer_email"],
+                  "terraform_plan_file_sha256": tfplan_sha256,
+                  "unsigned_pdf_sha256": unsigned_pdf_sha256,
+                  "mcp_output_pdf_sha256": mcp_pdf_sha256,
+                  "policy_version": audit["policy_version"],
+                  "state": audit["state"],
+              }
+              AUDIT_PATH.write_text(json.dumps(preserved, indent=2, sort_keys=True), encoding="utf-8")
+              serialized = json.dumps(preserved)
+              leaked = [v for v in (CLIENT_ID, CLIENT_SECRET, ANTHROPIC_KEY) if v and v in serialized]
+              check("no credential in the preserved metadata", not leaked, "credentials absent")
+
+              # ================= 9. Judge-facing summary ======================
+              lines = [
+                  "POLICYGATE AI — FINAL DEMO",
+                  "",
+                  "Claude API                     LIVE",
+                  "AI fallback                    NO",
+                  "Policy guardrails              PASS",
+                  "",
+                  "AWS Terraform                  LIVE",
+                  f"Resources add/change/destroy   {add} / {change} / {destroy}",
+                  f"tfplan SHA-256                 {tfplan_sha256}",
+                  "",
+                  "Foxit MCP                      LIVE",
+                  "MCP operation                  PASS",
+                  f"MCP output PDF SHA-256         {mcp_pdf_sha256}",
+                  "",
+                  "Foxit eSign                    LIVE",
+                  f"Folder ID                      {folder_id}",
+                  f"Expected human signer          {SIGNER_EMAIL}",
+                  "Agent signed                   NO",
+                  "",
+                  "FINAL STATE",
+                  "AWAITING_HUMAN_APPROVAL",
+                  "",
+                  "terraform apply                NOT RUN",
+                  "terraform destroy              NOT RUN",
+              ]
+              print("\n" + "=" * 72)
+              print("\n".join(lines))
+              print("=" * 72)
+
+              step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+              if step_summary:
+                  with open(step_summary, "a", encoding="utf-8") as fh:
+                      fh.write("```\n" + "\n".join(lines) + "\n```\n\n")
+                      fh.write("<details><summary>Run detail</summary>\n\n")
+                      fh.write("| Field | Value |\n| --- | --- |\n")
+                      fh.write(f"| Request ID | `{request.request_id}` |\n")
+                      fh.write(f"| Claude model | `{os.getenv('CLAUDE_MODEL')}` |\n")
+                      fh.write(f"| Terraform | `{os.getenv('POLICYGATE_TF_VERSION', 'unknown')}` in `{os.getenv('AWS_REGION')}` |\n")
+                      fh.write(f"| MCP server | `{MCP_SERVER}` @ `{os.getenv('FOXIT_MCP_SHA', '')[:12]}` |\n")
+                      fh.write(f"| MCP tools discovered | {mcp_outcome['tool_count']} |\n")
+                      fh.write(f"| MCP tool invoked | `{MCP_TOOL}` |\n")
+                      fh.write(f"| Unsigned PDF SHA-256 | `{unsigned_pdf_sha256}` |\n")
+                      fh.write(f"| Policy version | `{audit['policy_version']}` |\n")
+                      fh.write("\n</details>\n")
+
+              print(
+                  f"\nThe approval is now with {SIGNER_NAME} <{SIGNER_EMAIL}> in Foxit eSign. "
+                  "PolicyGate has stopped: nothing is signed, nothing is applied, "
+                  "and nothing is provisioned until a verified human signature exists."
+              )
+          finally:
+              # Neither PDF outlives the run: never uploaded as an artifact,
+              # never committed.
+              for path in (rendered_pdf_path, mcp_pdf_path):
+                  if path.exists():
+                      path.unlink()
+              print(f"\nLocal PDFs deleted from {workdir}")
+          PY
+
+      - name: Preserve the pre-sign audit metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: policygate-final-pre-sign-audit
+          path: ${{ runner.temp }}/pre-sign-audit.json
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Remove local Terraform, MCP and PDF artifacts
+        if: always()
+        run: |
+          set -euo pipefail
+          rm -rf terraform .terraform \
+                 "${RUNNER_TEMP}/policygate-final-demo" \
+                 "${RUNNER_TEMP}/foxit-mcp" \
+                 "${RUNNER_TEMP}/pre-sign-audit.json"
+          find . -name 'tfplan' -o -name 'terraform.tfstate' -o -name 'terraform.tfstate.*' \
+            | xargs -r rm -f
+          echo "Local Terraform artifacts, MCP checkout and PDFs removed."
+
+          dirty="$(git status --porcelain --untracked-files=all)"
+          if [ -n "${dirty}" ]; then
+            echo "::error::Working tree is not clean; the run left a file behind:" >&2
+            echo "${dirty}" >&2
+            exit 1
+          fi
+          echo "Working tree clean."

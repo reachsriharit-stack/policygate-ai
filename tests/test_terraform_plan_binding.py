@@ -75,6 +75,28 @@ class PdfRenderTerraformTests(unittest.TestCase):
         self.assertTrue(pdf_with.startswith(b"%PDF"))
         self.assertGreater(len(pdf_with), len(pdf_without))
 
+    def test_states_the_workflow_state_it_stops_in(self):
+        """An approval document should say where the agent halted, not leave a
+        reader to infer it from the absence of a signature."""
+        import base64
+        import re
+        import zlib
+
+        evidence = build_evidence_packet(make_policy_result(), terraform_plan=SAMPLE_TERRAFORM_PLAN)
+        pdf_bytes = render_evidence_pdf(evidence)
+
+        text = ""
+        for match in re.finditer(rb"stream\n(.*?)endstream", pdf_bytes, re.S):
+            try:
+                text += zlib.decompress(
+                    base64.a85decode(match.group(1).strip(), adobe=True)
+                ).decode("latin-1")
+            except Exception:  # pragma: no cover - non-content streams
+                continue
+
+        self.assertIn("AWAITING_HUMAN_APPROVAL", text)
+        self.assertIn("Workflow state", text)
+
     def test_handles_missing_plan_summary_gracefully(self):
         evidence = build_evidence_packet(
             make_policy_result(), terraform_plan={"plan_file_sha256": "abc"}
