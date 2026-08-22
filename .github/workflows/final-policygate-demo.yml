@@ -38,7 +38,7 @@ jobs:
   final-demo:
     name: Claude → guardrails → Terraform plan → PDF → Foxit MCP → eSign → STOP
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 25
 
     env:
       # --- Live Claude ---------------------------------------------------
@@ -164,6 +164,7 @@ jobs:
         run: |
           set -euo pipefail
           export AUDIT_PATH="${RUNNER_TEMP}/pre-sign-audit.json"
+          export FINAL_AUDIT_PATH="${RUNNER_TEMP}/final-audit.json"
           export DEMO_WORKDIR="${RUNNER_TEMP}/policygate-final-demo"
           python - <<'PY'
           import asyncio
@@ -186,7 +187,13 @@ jobs:
           # MCP-processed one, which workflow.run_workflow() has no hook for.
           import policygate.parser as parser_mod
           import policygate.provisioning.terraform_runner as tf_runner
-          from policygate.audit import build_pre_sign_audit
+          from policygate.approval_wait import (
+              ApprovalTimeout,
+              FolderMismatch,
+              assert_plan_hash_unchanged,
+              wait_for_executed_folder,
+          )
+          from policygate.audit import build_pre_sign_audit, finalize_from_foxit_folder
           from policygate.evidence import build_evidence_packet
           from policygate.foxit_client import FoxitESignClient
           from policygate.parser import parse
@@ -206,6 +213,11 @@ jobs:
               "High availability required, 30-day backups, "
               "maximum budget $900 per month."
           )
+          # The human wait: poll one folder every 10s for at most 15 minutes,
+          # inside a 25-minute job.
+          WAIT_TIMEOUT_SECONDS = 15 * 60
+          POLL_INTERVAL_SECONDS = 10
+
           MCP_SERVER = "foxitsoftware/foxit-pdf-api-mcp-server"
           MCP_TOOL = "pdf_compress"
           COMPRESSION_LEVEL = "MEDIUM"
@@ -224,7 +236,9 @@ jobs:
           rendered_pdf_path = workdir / "policygate-change-approval.pdf"
           mcp_pdf_path = workdir / "policygate-change-approval-mcp.pdf"
           mcp_log = workdir / "mcp-server-stderr.log"
+          signed_pdf_path = workdir / "policygate-change-approval-signed.pdf"
           AUDIT_PATH = Path(os.environ["AUDIT_PATH"])
+          FINAL_AUDIT_PATH = Path(os.environ["FINAL_AUDIT_PATH"])
 
 
           def safe(text: object) -> str:
@@ -601,6 +615,8 @@ jobs:
               else:
                   fail("authorize_provisioning() allowed provisioning before any human signed.")
 
+              pre_sign_terraform_verbs = [cmd[0] for cmd in executed_terraform if cmd]
+
               # ================= 8. Preserve safe metadata ====================
               preserved = {
                   "request_id": audit["request_id"],
@@ -617,41 +633,157 @@ jobs:
               leaked = [v for v in (CLIENT_ID, CLIENT_SECRET, ANTHROPIC_KEY) if v and v in serialized]
               check("no credential in the preserved metadata", not leaked, "credentials absent")
 
-              # ================= 9. Judge-facing summary ======================
-              lines = [
-                  "POLICYGATE AI — FINAL DEMO",
+              # ================= 9. The agent stops here ======================
+              stop_block = [
+                  "========================================",
+                  "POLICYGATE HAS STOPPED",
+                  "========================================",
+                  "",
+                  "State: AWAITING_HUMAN_APPROVAL",
+                  "Agent may sign: NO",
+                  f"Expected human signer: {SIGNER_EMAIL}",
+                  f"Foxit folder ID: {folder_id}",
+                  "",
+                  "Waiting for the human to review and sign in Foxit eSign.",
+              ]
+              print("\n" + "\n".join(stop_block))
+
+              phase_one = [
+                  "PHASE 1 — BEFORE HUMAN APPROVAL",
                   "",
                   "Claude API                     LIVE",
-                  "AI fallback                    NO",
-                  "Policy guardrails              PASS",
-                  "",
+                  "Deterministic guardrails       PASS",
                   "AWS Terraform                  LIVE",
                   f"Resources add/change/destroy   {add} / {change} / {destroy}",
                   f"tfplan SHA-256                 {tfplan_sha256}",
-                  "",
                   "Foxit MCP                      LIVE",
-                  "MCP operation                  PASS",
-                  f"MCP output PDF SHA-256         {mcp_pdf_sha256}",
-                  "",
                   "Foxit eSign                    LIVE",
-                  f"Folder ID                      {folder_id}",
+                  f"Foxit folder ID                {folder_id}",
                   f"Expected human signer          {SIGNER_EMAIL}",
                   "Agent signed                   NO",
+                  "State                          AWAITING_HUMAN_APPROVAL",
+              ]
+              step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+              if step_summary:
+                  # Written before the wait, so the evidence survives a timeout.
+                  with open(step_summary, "a", encoding="utf-8") as fh:
+                      fh.write("## PolicyGate AI — Final Demo\n\n")
+                      fh.write("```\n" + "\n".join(phase_one) + "\n```\n\n")
+
+              # ================= 10. Human wait phase =========================
+              # Read-only polling of this one folder. Nothing here signs,
+              # approves, or provisions; the only question asked of Foxit is
+              # whether the human has finished.
+              print(f"\nWaiting for human approval (up to {WAIT_TIMEOUT_SECONDS // 60} minutes)...")
+
+              def report_status(status: str, remaining: float) -> None:
+                  print(
+                      f"  Waiting for human approval... Foxit status: {status} "
+                      f"({int(remaining)}s remaining)"
+                  )
+
+              try:
+                  executed_folder = wait_for_executed_folder(
+                      client,
+                      folder_id,
+                      timeout_seconds=WAIT_TIMEOUT_SECONDS,
+                      poll_interval_seconds=POLL_INTERVAL_SECONDS,
+                      on_status=report_status,
+                  )
+              except ApprovalTimeout as exc:
+                  timeout_block = [
+                      "Human approval timeout.",
+                      "No infrastructure was provisioned.",
+                      "Final audit remains AWAITING_HUMAN_APPROVAL.",
+                  ]
+                  print("\n" + "\n".join(timeout_block))
+                  if step_summary:
+                      with open(step_summary, "a", encoding="utf-8") as fh:
+                          fh.write("```\n" + "\n".join(timeout_block) + "\n```\n")
+                  fail(f"{exc}")
+              except FolderMismatch as exc:
+                  fail(f"Foxit answered about a different folder: {exc}")
+
+              # ================= 11. Post-sign verification ===================
+              # PolicyGate's own completion code decides whether the signature
+              # counts: same folder, EXECUTED, expected signer.
+              print("\nHuman signature detected. Verifying.")
+              signed_pdf = client.download_document(folder_id, doc_number=1)
+              signed_pdf_path.write_bytes(signed_pdf)
+              on_disk = signed_pdf_path.read_bytes()
+              check("signed PDF is non-empty", len(on_disk) > 0, f"{len(on_disk)} bytes")
+              check("signed PDF begins with %PDF", on_disk[:4] == b"%PDF", repr(on_disk[:4]))
+              signed_pdf_sha256 = sha256(on_disk).hexdigest()
+              check("signed PDF SHA-256 computed", len(signed_pdf_sha256) == 64, signed_pdf_sha256)
+
+              try:
+                  final_audit = finalize_from_foxit_folder(audit, executed_folder, on_disk)
+              except ValueError as exc:
+                  fail(f"PolicyGate refused to finalize this approval: {exc}")
+
+              verified_signer = str(final_audit.get("verified_signer_email") or "")
+              check("same Foxit folder", final_audit.get("foxit_folder_id") == folder_id, folder_id)
+              check(
+                  "Foxit status is EXECUTED",
+                  final_audit.get("foxit_folder_status") == "EXECUTED",
+                  str(final_audit.get("foxit_folder_status")),
+              )
+              check(
+                  "verified signer matches the expected approver",
+                  verified_signer.lower() == SIGNER_EMAIL.lower(),
+                  f"expected={SIGNER_EMAIL} verified={verified_signer}",
+              )
+              check("agent_may_sign remains false", final_audit.get("agent_may_sign") is False, "agent_may_sign=false")
+              check("final audit state", final_audit.get("state") == "APPROVED", str(final_audit.get("state")))
+              check(
+                  "signed PDF hash bound into the audit",
+                  final_audit.get("signed_pdf_sha256") == signed_pdf_sha256,
+                  signed_pdf_sha256,
+              )
+
+              # The plan the human signed for must still be the plan that was
+              # hashed, bound into the evidence and rendered into the PDF
+              # before signing. Terraform is never re-run after approval.
+              try:
+                  assert_plan_hash_unchanged(final_audit, tfplan_sha256)
+              except ValueError as exc:
+                  fail(str(exc))
+              check("Terraform plan SHA-256 unchanged across the boundary", True, tfplan_sha256)
+              post_sign_verbs = [cmd[0] for cmd in executed_terraform if cmd]
+              check(
+                  "no terraform command ran after signing",
+                  post_sign_verbs == pre_sign_terraform_verbs,
+                  " ".join(post_sign_verbs) or "<none>",
+              )
+
+              FINAL_AUDIT_PATH.write_text(
+                  json.dumps(final_audit, indent=2, sort_keys=True, default=str), encoding="utf-8"
+              )
+
+              # ================= 12. Judge-facing summary =====================
+              phase_two = [
+                  "PHASE 2 — AFTER HUMAN APPROVAL",
                   "",
-                  "FINAL STATE",
-                  "AWAITING_HUMAN_APPROVAL",
+                  f"Foxit status                   {final_audit.get('foxit_folder_status')}",
+                  f"Expected signer                {SIGNER_EMAIL}",
+                  f"Verified signer                {verified_signer}",
+                  "Human signature                VERIFIED",
+                  "Agent signed                   NO",
+                  "Terraform plan hash            VERIFIED",
+                  f"Signed PDF SHA-256             {signed_pdf_sha256}",
+                  f"Final audit                    {final_audit.get('state')}",
                   "",
                   "terraform apply                NOT RUN",
                   "terraform destroy              NOT RUN",
               ]
               print("\n" + "=" * 72)
-              print("\n".join(lines))
+              print("\n".join(phase_one))
+              print("\n" + "\n".join(phase_two))
               print("=" * 72)
 
-              step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
               if step_summary:
                   with open(step_summary, "a", encoding="utf-8") as fh:
-                      fh.write("```\n" + "\n".join(lines) + "\n```\n\n")
+                      fh.write("```\n" + "\n".join(phase_two) + "\n```\n\n")
                       fh.write("<details><summary>Run detail</summary>\n\n")
                       fh.write("| Field | Value |\n| --- | --- |\n")
                       fh.write(f"| Request ID | `{request.request_id}` |\n")
@@ -661,28 +793,42 @@ jobs:
                       fh.write(f"| MCP tools discovered | {mcp_outcome['tool_count']} |\n")
                       fh.write(f"| MCP tool invoked | `{MCP_TOOL}` |\n")
                       fh.write(f"| Unsigned PDF SHA-256 | `{unsigned_pdf_sha256}` |\n")
+                      fh.write(f"| MCP output PDF SHA-256 | `{mcp_pdf_sha256}` |\n")
                       fh.write(f"| Policy version | `{audit['policy_version']}` |\n")
                       fh.write("\n</details>\n")
 
               print(
-                  f"\nThe approval is now with {SIGNER_NAME} <{SIGNER_EMAIL}> in Foxit eSign. "
-                  "PolicyGate has stopped: nothing is signed, nothing is applied, "
-                  "and nothing is provisioned until a verified human signature exists."
+                  f"\nA human ({verified_signer}) signed the approval. The audit is APPROVED and "
+                  "bound to the exact Terraform plan that was hashed before signing. "
+                  "Provisioning remains a separate, deliberate step — this workflow "
+                  "does not apply anything."
               )
+
           finally:
               # Neither PDF outlives the run: never uploaded as an artifact,
               # never committed.
-              for path in (rendered_pdf_path, mcp_pdf_path):
+              for path in (rendered_pdf_path, mcp_pdf_path, signed_pdf_path):
                   if path.exists():
                       path.unlink()
               print(f"\nLocal PDFs deleted from {workdir}")
           PY
 
       - name: Preserve the pre-sign audit metadata
+        # Uploaded even on a timeout: the evidence that the agent stopped is
+        # worth keeping whether or not the human got to the document in time.
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: policygate-final-pre-sign-audit
           path: ${{ runner.temp }}/pre-sign-audit.json
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Preserve the final audit record
+        uses: actions/upload-artifact@v4
+        with:
+          name: policygate-final-audit
+          path: ${{ runner.temp }}/final-audit.json
           if-no-files-found: error
           retention-days: 7
 
@@ -693,7 +839,8 @@ jobs:
           rm -rf terraform .terraform \
                  "${RUNNER_TEMP}/policygate-final-demo" \
                  "${RUNNER_TEMP}/foxit-mcp" \
-                 "${RUNNER_TEMP}/pre-sign-audit.json"
+                 "${RUNNER_TEMP}/pre-sign-audit.json" \
+                 "${RUNNER_TEMP}/final-audit.json"
           find . -name 'tfplan' -o -name 'terraform.tfstate' -o -name 'terraform.tfstate.*' \
             | xargs -r rm -f
           echo "Local Terraform artifacts, MCP checkout and PDFs removed."
