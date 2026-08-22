@@ -53,7 +53,6 @@ jobs:
       POLICYGATE_ALLOW_APPLY: "false"
       POLICYGATE_ALLOW_DESTROY: "false"
       POLICYGATE_SUBMISSION_MODE: "false"
-      AUDIT_PATH: ${{ github.workspace }}/../pre-sign-audit.json
 
     steps:
       - name: Check out repository
@@ -100,6 +99,9 @@ jobs:
       - name: Route the approval to the human signer
         run: |
           set -euo pipefail
+          # RUNNER_TEMP, not a path above the workspace: upload-artifact@v4
+          # rejects anything outside the workspace root.
+          export AUDIT_PATH="${RUNNER_TEMP}/pre-sign-audit.json"
           python - <<'PY'
           import json
           import os
@@ -386,19 +388,19 @@ jobs:
       - name: Preserve the pre-sign audit metadata
         uses: actions/upload-artifact@v4
         with:
-          name: policygate-pre-sign-audit-${{ github.run_id }}
+          name: policygate-pre-sign-audit
           # Non-secret verification metadata only: request id, folder id,
           # expected signer, approval PDF hash, approved plan hash. The approval
           # PDF, credentials and Terraform state are never uploaded.
-          path: ${{ github.workspace }}/../pre-sign-audit.json
+          path: ${{ runner.temp }}/pre-sign-audit.json
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 7
 
       - name: Remove the local audit file and verify the tree is clean
         if: always()
         run: |
           set -euo pipefail
-          rm -f "${AUDIT_PATH}"
+          rm -f "${RUNNER_TEMP}/pre-sign-audit.json"
           dirty="$(git status --porcelain --untracked-files=all)"
           if [ -n "${dirty}" ]; then
             echo "::error::Working tree is not clean; the run left a file behind:" >&2
