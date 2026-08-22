@@ -1,0 +1,428 @@
+name: Live Foxit MCP Integration Test
+
+# Manual only. This workflow runs the official Foxit PDF API MCP server and
+# drives it over stdio with a real MCP client, against real Foxit credentials.
+# It must never be triggered by push or pull_request.
+#
+# Scope of this milestone: prove MCP protocol/tool usage. PolicyGate renders a
+# real approval PDF, then every Foxit interaction goes through MCP tool calls —
+# there is no direct Foxit REST client anywhere in this job. Foxit eSign is NOT
+# called, no Terraform runs, and no AWS resource is touched.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-foxit-mcp-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Official server: https://github.com/foxitsoftware/foxit-pdf-api-mcp-server
+  # Pinned to a concrete commit so a future upstream push cannot silently
+  # change what this test executes. Bump deliberately.
+  FOXIT_MCP_REPO: https://github.com/foxitsoftware/foxit-pdf-api-mcp-server.git
+  FOXIT_MCP_SHA: db16f9d0f18b878a07f41621e708dbb78bc13e4c
+  # The current Python implementation. The deprecated stdio-python tree is not
+  # used.
+  FOXIT_MCP_PACKAGE_PATH: python/foxit-pdf-api-mcp-server
+
+jobs:
+  live-foxit-mcp:
+    name: Official Foxit MCP server over stdio (no eSign, no Terraform)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      # Secrets: handed to the MCP server subprocess through its environment
+      # and never printed. Every string this job logs is scrubbed of both
+      # values first.
+      FOXIT_CLOUD_API_CLIENT_ID: ${{ secrets.FOXIT_CLOUD_API_CLIENT_ID }}
+      FOXIT_CLOUD_API_CLIENT_SECRET: ${{ secrets.FOXIT_CLOUD_API_CLIENT_SECRET }}
+      # Repository variable, not a secret. The server's config.py reads
+      # FOXIT_CLOUD_API_BASE_URL or FOXIT_CLOUD_API_HOST.
+      FOXIT_CLOUD_API_HOST: ${{ vars.FOXIT_CLOUD_API_HOST }}
+      # PolicyGate stays on its local, offline paths for everything else.
+      POLICYGATE_INCLUDE_TERRAFORM_PLAN: "false"
+      POLICYGATE_ALLOW_APPLY: "false"
+      POLICYGATE_ALLOW_DESTROY: "false"
+      POLICYGATE_SUBMISSION_MODE: "false"
+      POLICYGATE_FOXIT_SEND_NOW: "false"
+      POLICYGATE_EMBEDDED_SIGNING: "false"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Verify Foxit configuration is present
+        run: |
+          set -euo pipefail
+          # Presence tests only. No value is printed or transformed.
+          missing=0
+          if [ -z "${FOXIT_CLOUD_API_CLIENT_ID:-}" ]; then
+            echo "::error::Secret FOXIT_CLOUD_API_CLIENT_ID is not configured." >&2
+            missing=1
+          fi
+          if [ -z "${FOXIT_CLOUD_API_CLIENT_SECRET:-}" ]; then
+            echo "::error::Secret FOXIT_CLOUD_API_CLIENT_SECRET is not configured." >&2
+            missing=1
+          fi
+          if [ -z "${FOXIT_CLOUD_API_HOST:-}" ]; then
+            echo "::error::Repository variable FOXIT_CLOUD_API_HOST is not set." >&2
+            missing=1
+          fi
+          [ "$missing" -eq 0 ] || exit 1
+          echo "Foxit client id: present"
+          echo "Foxit client secret: present"
+          echo "Foxit PDF Services host: configured"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install PolicyGate dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -r requirements.lock
+
+      - name: Clone the official Foxit MCP server at the pinned commit
+        run: |
+          set -euo pipefail
+          checkout="${RUNNER_TEMP}/foxit-mcp"
+          rm -rf "${checkout}"
+          # Cloned outside the repository working tree so nothing it contains
+          # can ever be staged or committed here.
+          git clone --quiet --no-checkout "${FOXIT_MCP_REPO}" "${checkout}"
+          git -C "${checkout}" checkout --quiet "${FOXIT_MCP_SHA}"
+
+          head="$(git -C "${checkout}" rev-parse HEAD)"
+          if [ "${head}" != "${FOXIT_MCP_SHA}" ]; then
+            echo "::error::Checked out ${head}, expected the pinned ${FOXIT_MCP_SHA}." >&2
+            exit 1
+          fi
+          echo "Foxit MCP server pinned at ${head}"
+
+          # Guard the "current Python implementation" requirement: fail loudly
+          # if upstream ever moves or renames this tree, rather than silently
+          # falling back to the deprecated stdio-python server.
+          pkg="${checkout}/${FOXIT_MCP_PACKAGE_PATH}"
+          if [ ! -f "${pkg}/pyproject.toml" ]; then
+            echo "::error::Expected the current Python server at ${FOXIT_MCP_PACKAGE_PATH}." >&2
+            exit 1
+          fi
+          echo "Using ${FOXIT_MCP_PACKAGE_PATH} (not the deprecated stdio-python implementation)."
+
+      - name: Install the official Foxit MCP server
+        run: |
+          set -euo pipefail
+          pip install "${RUNNER_TEMP}/foxit-mcp/${FOXIT_MCP_PACKAGE_PATH}"
+          python - <<'PY'
+          import importlib.metadata as meta
+          print("foxit-pdf-api-mcp-server", meta.version("foxit-pdf-api-mcp-server"))
+          print("mcp client sdk", meta.version("mcp"))
+          print("fastmcp", meta.version("fastmcp"))
+          PY
+
+      - name: Drive the Foxit MCP server over stdio against a PolicyGate PDF
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import asyncio
+          import json
+          import os
+          import sys
+          from hashlib import sha256
+          from pathlib import Path
+
+          from mcp import ClientSession, StdioServerParameters
+          from mcp.client.stdio import stdio_client
+
+          # PolicyGate's own renderer and evidence pipeline — no second PDF
+          # implementation. See policygate/pdf_render.py.
+          import policygate.foxit_client as foxit_mod
+          from policygate.evidence import build_evidence_packet
+          from policygate.parser import parse
+          from policygate.pdf_render import render_evidence_pdf
+          from policygate.planner import build_plan
+          from policygate.rules import evaluate
+
+          REQUEST = (
+              "Provision production PostgreSQL on AWS in us-east-1. "
+              "High availability required, 30-day backups, "
+              "maximum budget $900 per month. "
+              "Approver: Jane Smith, jane@example.com."
+          )
+
+          MCP_SERVER = "foxitsoftware/foxit-pdf-api-mcp-server"
+          # Compression: reversible in the sense that matters here — it
+          # rewrites the file without altering the approval content, so the
+          # document a human would sign is preserved.
+          OPERATION_TOOL = "pdf_compress"
+          COMPRESSION_LEVEL = "MEDIUM"
+          REQUIRED_TOOLS = ("upload_document", OPERATION_TOOL, "download_document")
+
+          CLIENT_ID = os.environ.get("FOXIT_CLOUD_API_CLIENT_ID", "")
+          CLIENT_SECRET = os.environ.get("FOXIT_CLOUD_API_CLIENT_SECRET", "")
+          HOST = os.environ.get("FOXIT_CLOUD_API_HOST", "").strip()
+
+          if not (CLIENT_ID and CLIENT_SECRET and HOST):
+              sys.exit("FAIL: Foxit credentials/host missing; refusing to run a 'live' test.")
+
+          # Everything transient lives outside the repository working tree.
+          workdir = Path(os.environ["RUNNER_TEMP"]) / "policygate-foxit-mcp"
+          workdir.mkdir(parents=True, exist_ok=True)
+          input_pdf = workdir / "policygate-approval.pdf"
+          output_pdf = workdir / "policygate-approval-compressed.pdf"
+          server_log = workdir / "mcp-server-stderr.log"
+
+
+          def safe(text: object) -> str:
+              """No credential reaches the log, not even inside an error the
+              MCP server or Foxit echoes back."""
+              out = str(text)
+              for secret in (CLIENT_SECRET, CLIENT_ID):
+                  if secret:
+                      out = out.replace(secret, "***REDACTED***")
+              return out
+
+
+          def fail(message: str) -> None:
+              print(f"::error::{safe(message)}")
+              raise SystemExit(f"FAIL: {safe(message)}")
+
+
+          def check(label: str, ok: bool, detail: str) -> None:
+              print(f"  [{'PASS' if ok else 'FAIL'}] {label}: {safe(detail)}")
+              if not ok:
+                  fail(f"{label}: {detail}")
+
+
+          # --- Guard: Foxit eSign is not part of this milestone. ---------------
+          def _esign_forbidden(*_args, **_kwargs):
+              raise RuntimeError("Foxit eSign is not called by this workflow.")
+
+
+          foxit_mod.FoxitESignClient.create_human_approval_draft = _esign_forbidden
+
+          # --- 1. Render a real PolicyGate approval PDF. -----------------------
+          print("Rendering the Change Approval / Evidence PDF with policygate.pdf_render\n")
+          request = parse(REQUEST, requested_by="GitHub Actions live Foxit MCP test")
+          plan = build_plan(request)
+          policy_result = evaluate(request, plan)
+          evidence = build_evidence_packet(policy_result)
+          input_pdf.write_bytes(render_evidence_pdf(evidence))
+
+          input_bytes = input_pdf.read_bytes()
+          print("Input PDF")
+          check("PolicyGate validation passed", policy_result.passed, str(policy_result.passed))
+          check("input PDF exists", input_pdf.is_file(), str(input_pdf))
+          check("input PDF size > 0", len(input_bytes) > 0, f"{len(input_bytes)} bytes")
+          check("input PDF magic bytes", input_bytes[:4] == b"%PDF", repr(input_bytes[:4]))
+          input_sha256 = sha256(input_bytes).hexdigest()
+          check("input PDF SHA-256 computed", len(input_sha256) == 64, input_sha256)
+
+          # The server's own FastMCP instance, run over stdio. Upstream's
+          # main() wraps a synchronous FastMCP.run() in asyncio.run(), which
+          # raises "a coroutine was expected" while tearing the process down
+          # after the session ends; launching the same registered server object
+          # directly avoids that noise without changing which tools are served.
+          LAUNCH = (
+              "from foxit_pdf_api_mcp_server.server import mcp; "
+              'mcp.run(transport="stdio")'
+          )
+          server_env = {
+              "PATH": os.environ.get("PATH", ""),
+              "HOME": os.environ.get("HOME", ""),
+              "PYTHONUNBUFFERED": "1",
+              "FOXIT_CLOUD_API_CLIENT_ID": CLIENT_ID,
+              "FOXIT_CLOUD_API_CLIENT_SECRET": CLIENT_SECRET,
+              "FOXIT_CLOUD_API_HOST": HOST,
+          }
+          params = StdioServerParameters(
+              command=sys.executable,
+              args=["-c", LAUNCH],
+              env=server_env,
+              cwd=str(workdir),
+          )
+
+
+          def tool_payload(result, tool_name: str) -> dict:
+              """Every Foxit MCP tool returns a JSON string; failures come back
+              as {"success": false, ...} rather than an MCP protocol error, so
+              the payload has to be inspected, not just the call."""
+              if getattr(result, "isError", False):
+                  fail(f"MCP call to {tool_name} returned a protocol error: {result}")
+              blocks = [b for b in (result.content or []) if getattr(b, "text", None)]
+              if not blocks:
+                  fail(f"MCP call to {tool_name} returned no text content")
+              try:
+                  payload = json.loads(blocks[0].text)
+              except ValueError:
+                  fail(f"{tool_name} did not return JSON: {blocks[0].text[:400]}")
+              if not isinstance(payload, dict):
+                  fail(f"{tool_name} returned {type(payload).__name__}, expected an object")
+              if not payload.get("success"):
+                  fail(f"{tool_name} failed: {json.dumps(payload)[:600]}")
+              return payload
+
+
+          async def run() -> dict:
+              with server_log.open("w", encoding="utf-8") as errlog:
+                  async with stdio_client(params, errlog=errlog) as (read, write):
+                      async with ClientSession(read, write) as session:
+                          init = await session.initialize()
+                          print("\nMCP session")
+                          server_name = getattr(init.serverInfo, "name", "")
+                          check("MCP handshake", bool(server_name), f"{server_name} {getattr(init.serverInfo, 'version', '')}")
+
+                          # --- 2. Discover the tools the server registers. ----
+                          listed = await session.list_tools()
+                          names = sorted(tool.name for tool in listed.tools)
+                          check("tools discovered", bool(names), f"{len(names)} tools")
+                          print(f"    {', '.join(names)}")
+                          for wanted in REQUIRED_TOOLS:
+                              check(f"tool registered: {wanted}", wanted in names, "present")
+
+                          # --- 3. Upload the approval PDF through MCP. --------
+                          print("\nFoxit operations (every one via an MCP tool call)")
+                          uploaded = tool_payload(
+                              await session.call_tool(
+                                  "upload_document",
+                                  {"resourceUri": f"file://{input_pdf}"},
+                              ),
+                              "upload_document",
+                          )
+                          document_id = str(uploaded.get("documentId") or "")
+                          check("upload_document returned a documentId", bool(document_id), document_id)
+
+                          # --- 4. One real, content-preserving operation. -----
+                          operated = tool_payload(
+                              await session.call_tool(
+                                  OPERATION_TOOL,
+                                  {
+                                      "documentId": document_id,
+                                      "compressionLevel": COMPRESSION_LEVEL,
+                                  },
+                              ),
+                              OPERATION_TOOL,
+                          )
+                          result_document_id = str(operated.get("resultDocumentId") or "")
+                          task_id = str(operated.get("taskId") or "")
+                          check(f"{OPERATION_TOOL} returned a resultDocumentId", bool(result_document_id), result_document_id)
+                          check(
+                              "Foxit produced a new document",
+                              bool(result_document_id) and result_document_id != document_id,
+                              f"input={document_id} result={result_document_id}",
+                          )
+                          check("Foxit ran a real task", bool(task_id), f"taskId={task_id}")
+
+                          # --- 5. Retrieve the processed PDF through MCP. -----
+                          downloaded = tool_payload(
+                              await session.call_tool(
+                                  "download_document",
+                                  {
+                                      "documentId": result_document_id,
+                                      "outputPath": str(output_pdf),
+                                  },
+                              ),
+                              "download_document",
+                          )
+                          check(
+                              "download_document reported bytes",
+                              int(downloaded.get("size") or 0) > 0,
+                              f"{downloaded.get('size')} bytes",
+                          )
+                          return {
+                              "tool_count": len(names),
+                              "document_id": document_id,
+                              "result_document_id": result_document_id,
+                              "task_id": task_id,
+                          }
+
+
+          try:
+              outcome = asyncio.run(run())
+
+              # --- 6. The MCP server really ran, and really produced a PDF. ---
+              log_text = server_log.read_text(encoding="utf-8", errors="replace") if server_log.exists() else ""
+              print("\nEvidence")
+              check(
+                  "MCP server process started and served the session",
+                  "Starting MCP server" in log_text,
+                  f"server stderr: {len(log_text.splitlines())} lines",
+              )
+              check("output PDF exists", output_pdf.is_file(), str(output_pdf))
+
+              output_bytes = output_pdf.read_bytes() if output_pdf.is_file() else b""
+              check("output PDF size > 0", len(output_bytes) > 0, f"{len(output_bytes)} bytes")
+              check("output PDF magic bytes", output_bytes[:4] == b"%PDF", repr(output_bytes[:4]))
+              output_sha256 = sha256(output_bytes).hexdigest()
+              check("output PDF SHA-256 computed", len(output_sha256) == 64, output_sha256)
+              print(
+                  f"  [INFO] byte delta: {len(input_bytes)} -> {len(output_bytes)} "
+                  f"({len(output_bytes) - len(input_bytes):+d})"
+              )
+
+              summary = [
+                  "",
+                  "=" * 72,
+                  "Foxit MCP: LIVE",
+                  f"MCP server: {MCP_SERVER}",
+                  f"MCP tool invoked: {OPERATION_TOOL}",
+                  "Foxit operation: PASS",
+                  f"Input PDF SHA-256: {input_sha256}",
+                  f"Output PDF SHA-256: {output_sha256}",
+                  "eSign: NOT CALLED",
+                  "terraform apply: NOT RUN",
+                  "terraform destroy: NOT RUN",
+                  "=" * 72,
+              ]
+              print("\n".join(summary))
+
+              step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+              if step_summary:
+                  with open(step_summary, "a", encoding="utf-8") as fh:
+                      fh.write("### PolicyGate live Foxit MCP integration test\n\n")
+                      fh.write("| Field | Value |\n| --- | --- |\n")
+                      fh.write("| Foxit MCP | LIVE |\n")
+                      fh.write(f"| MCP server | `{MCP_SERVER}` @ `{os.environ.get('FOXIT_MCP_SHA', '')[:12]}` |\n")
+                      fh.write(f"| Tools discovered | {outcome['tool_count']} |\n")
+                      fh.write(f"| MCP tool invoked | `{OPERATION_TOOL}` |\n")
+                      fh.write("| Foxit operation | PASS |\n")
+                      fh.write(f"| Input PDF SHA-256 | `{input_sha256}` |\n")
+                      fh.write(f"| Output PDF SHA-256 | `{output_sha256}` |\n")
+                      fh.write("| eSign | NOT CALLED |\n")
+                      fh.write("| terraform apply | NOT RUN |\n")
+                      fh.write("| terraform destroy | NOT RUN |\n")
+          finally:
+              # Neither PDF outlives the test: not uploaded as a GitHub
+              # artifact, not committed, not left on the runner.
+              for path in (input_pdf, output_pdf):
+                  if path.exists():
+                      path.unlink()
+              print(f"\nLocal PDFs deleted from {workdir}")
+          PY
+
+      - name: Remove temporary PDFs and the MCP checkout
+        if: always()
+        run: |
+          set -euo pipefail
+          rm -rf "${RUNNER_TEMP}/policygate-foxit-mcp" "${RUNNER_TEMP}/foxit-mcp"
+          for leftover in "${RUNNER_TEMP}/policygate-foxit-mcp" "${RUNNER_TEMP}/foxit-mcp"; do
+            if [ -e "${leftover}" ]; then
+              echo "::error::${leftover} still present after cleanup." >&2
+              exit 1
+            fi
+          done
+          echo "Temporary PDFs and the Foxit MCP checkout removed."
+
+          dirty="$(git status --porcelain --untracked-files=all)"
+          if [ -n "${dirty}" ]; then
+            echo "::error::Working tree is not clean; the test left a file behind:" >&2
+            echo "${dirty}" >&2
+            exit 1
+          fi
+          echo "Working tree clean: nothing generated was committed or staged."
