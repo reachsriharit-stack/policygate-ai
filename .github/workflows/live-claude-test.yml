@@ -1,0 +1,194 @@
+name: Live Claude Smoke Test
+
+# Manual only. This workflow makes a real, billable Anthropic API call, so it
+# must never be triggered by push or pull_request.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-claude-test-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  live-claude-smoke-test:
+    name: Live PolicyGate request through the real Claude parser
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      # Secret: consumed only by the Anthropic SDK via the environment.
+      # It is never echoed, substringed, or written to logs anywhere below.
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      # Non-secret configuration.
+      CLAUDE_MODEL: claude-sonnet-5
+      POLICYGATE_ALLOW_AI_FALLBACK: "false"
+      POLICYGATE_INCLUDE_TERRAFORM_PLAN: "false"
+      POLICYGATE_ALLOW_APPLY: "false"
+      POLICYGATE_ALLOW_DESTROY: "false"
+      POLICYGATE_SUBMISSION_MODE: "false"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Verify ANTHROPIC_API_KEY is present
+        run: |
+          set -euo pipefail
+          # Presence test only. The value is never printed or transformed.
+          if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+            echo "::error::ANTHROPIC_API_KEY is not configured for this repository." >&2
+            echo "Add it under Settings -> Secrets and variables -> Actions." >&2
+            exit 1
+          fi
+          echo "ANTHROPIC_API_KEY is present."
+
+      - name: Install locked dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -r requirements.lock
+
+      - name: Run one live PolicyGate request through Claude
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          import sys
+
+          import policygate.parser as parser_mod
+          import policygate.workflow as workflow_mod
+          from policygate.schema import WorkflowState
+
+          REQUEST = (
+              "Provision production PostgreSQL on AWS in us-east-1. "
+              "High availability required, 30-day backups, maximum budget $900 per month. "
+              "Approver: Jane Smith, jane@example.com."
+          )
+
+          failures: list[str] = []
+
+
+          def check(label: str, ok: bool, detail: str) -> None:
+              print(f"  [{'PASS' if ok else 'FAIL'}] {label}: {detail}")
+              if not ok:
+                  failures.append(f"{label}: {detail}")
+
+
+          # --- Guard 1: the API key must exist. Presence only; never printed. ---
+          if not os.environ.get("ANTHROPIC_API_KEY", "").strip():
+              sys.exit("FAIL: ANTHROPIC_API_KEY is absent; refusing to run a 'live' test offline.")
+
+          # --- Guard 2: the offline parser must never run. -----------------------
+          # policygate.parser.parse() silently falls back to parse_offline when the
+          # key is missing, and on error when POLICYGATE_ALLOW_AI_FALLBACK=true.
+          # Replacing it turns any fallback into a hard failure instead of a
+          # green build that never touched the Claude API.
+          def _offline_forbidden(*_args, **_kwargs):
+              raise RuntimeError(
+                  "Offline parser fallback was invoked; this smoke test requires the live Claude parser."
+              )
+
+
+          parser_mod.parse_offline = _offline_forbidden
+
+          _live_call = {"count": 0}
+          _real_parse_with_claude = parser_mod.parse_with_claude
+
+
+          def _tracked_parse_with_claude(nl_request, requested_by):
+              _live_call["count"] += 1
+              return _real_parse_with_claude(nl_request, requested_by)
+
+
+          parser_mod.parse_with_claude = _tracked_parse_with_claude
+
+          # --- Guard 3: no terraform plan/apply/destroy, no AWS provisioning. ----
+          def _terraform_forbidden(*_args, **_kwargs):
+              raise RuntimeError("terraform execution is not permitted in this smoke test")
+
+
+          workflow_mod.generate_and_plan = _terraform_forbidden
+
+          # --- Guard 4: no Foxit calls. Unconfigured credentials keep the ---------
+          # workflow on the local mock handoff path, which performs no network I/O.
+          for var in (
+              "FOXIT_ESIGN_CLIENT_ID",
+              "FOXIT_ESIGN_CLIENT_SECRET",
+              "FOXIT_CLOUD_API_CLIENT_ID",
+              "FOXIT_CLOUD_API_CLIENT_SECRET",
+          ):
+              os.environ.pop(var, None)
+          os.environ["POLICYGATE_FOXIT_SEND_NOW"] = "false"
+          os.environ["POLICYGATE_EMBEDDED_SIGNING"] = "false"
+
+          print(f"Model: {os.getenv('CLAUDE_MODEL')}")
+          print("Sending one live request to the Claude API...\n")
+
+          try:
+              result = workflow_mod.run_workflow(
+                  REQUEST,
+                  requested_by="GitHub Actions live smoke test",
+                  include_terraform_plan=False,
+              )
+          except Exception as exc:  # noqa: BLE001 - any failure fails the build
+              sys.exit(f"FAIL: live Claude workflow raised {type(exc).__name__}: {exc}")
+
+          request = result.policy_result.request
+          plan = result.policy_result.plan
+
+          print("Parsed intent")
+          check("live Claude parser used", _live_call["count"] == 1, f"parse_with_claude calls={_live_call['count']}")
+          check("environment", request.environment == "production", str(request.environment))
+          check("database engine", request.database_engine == "postgresql", str(request.database_engine))
+          check("cloud", request.cloud == "aws", str(request.cloud))
+          check("region", request.region == "us-east-1", str(request.region))
+          check("high availability", request.high_availability is True, str(request.high_availability))
+          check("backup retention days", request.backup_retention_days == 30, str(request.backup_retention_days))
+          check(
+              "monthly budget usd",
+              request.monthly_budget_usd is not None and float(request.monthly_budget_usd) == 900.0,
+              str(request.monthly_budget_usd),
+          )
+
+          print("\nDeterministic guardrails")
+          for rule in result.policy_result.checks:
+              check(rule.code, rule.passed, f"{rule.description} (actual={rule.actual}; expected={rule.expected})")
+          check("all deterministic checks passed", result.policy_result.passed, str(result.policy_result.passed))
+
+          print("\nSafety boundaries")
+          check(
+              "no terraform plan bound",
+              not (result.evidence or {}).get("terraform_plan"),
+              "terraform_plan absent from evidence",
+          )
+          check(
+              "no live Foxit call",
+              result.handoff is not None and result.handoff.mock is True,
+              f"handoff provider={getattr(result.handoff, 'provider', None)}",
+          )
+
+          print("\nFinal state")
+          check(
+              "workflow state",
+              result.state == WorkflowState.AWAITING_HUMAN_APPROVAL,
+              str(getattr(result.state, "value", result.state)),
+          )
+          print(f"  Plan: {plan.instance_class} in {plan.region}, HA={plan.high_availability}, "
+                f"backups={plan.backup_retention_days}d, est=${plan.estimated_monthly_cost_usd:,.0f}/mo")
+
+          if failures:
+              print("\n" + "=" * 70)
+              for failure in failures:
+                  print(f"::error::{failure}")
+              sys.exit(f"\nFAIL: {len(failures)} live smoke-test assertion(s) failed.")
+
+          print("\nPASS: live Claude smoke test succeeded; stopped at AWAITING_HUMAN_APPROVAL.")
+          PY
