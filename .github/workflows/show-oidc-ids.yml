@@ -1,0 +1,15 @@
+name: Show GitHub OIDC IDs
+
+on:
+  workflow_dispatch:
+
+jobs:
+  show:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Show repository IDs
+        run: |
+          echo "repository_owner=${{ github.repository_owner }}"
+          echo "repository_owner_id=${{ github.repository_owner_id }}"
+          echo "repository=${{ github.repository }}"
+          echo "repository_id=${{ github.repository_id }}"
