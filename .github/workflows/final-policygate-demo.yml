@@ -10,6 +10,13 @@ name: PolicyGate AI — Final Demo
 on:
   workflow_dispatch:
     inputs:
+      request_text:
+        description: 'Plain-English infrastructure request'
+        required: true
+        default: >
+          Provision production PostgreSQL on AWS in us-east-1.
+          High availability required, 30-day backups,
+          maximum budget $900 per month.
       signer_first_name:
         description: 'First name of the human approver.'
         required: true
@@ -51,6 +58,10 @@ jobs:
       FOXIT_CLOUD_API_HOST: ${{ vars.FOXIT_CLOUD_API_HOST }}
       FOXIT_ESIGN_TRANSPORT: developer_platform
       FOXIT_ESIGN_BASE_URL: https://na1.fusion.foxit.com
+      # --- The request, from the dispatch input --------------------------
+      # Dispatch text reaches the script through the environment, never by
+      # interpolation into a run: block, so it cannot escape into the shell.
+      POLICYGATE_REQUEST_TEXT: ${{ inputs.request_text }}
       # --- Human approver, from the dispatch inputs ----------------------
       POLICYGATE_SIGNER_FIRST_NAME: ${{ inputs.signer_first_name }}
       POLICYGATE_SIGNER_LAST_NAME: ${{ inputs.signer_last_name }}
@@ -210,11 +221,12 @@ jobs:
           from policygate.runtime_status import enforce_submission_mode, get_runtime_status
           from policygate.schema import WorkflowState
 
-          REQUEST = (
-              "Provision production PostgreSQL on AWS in us-east-1. "
-              "High availability required, 30-day backups, "
-              "maximum budget $900 per month."
-          )
+          # The request the operator dispatched, whitespace-normalised. It goes
+          # into the same parse() -> build_plan() -> evaluate() path as before;
+          # nothing about the guardrails, Terraform generation or Foxit routing
+          # depends on where the text came from.
+          REQUEST = " ".join((os.environ.get("POLICYGATE_REQUEST_TEXT") or "").split())
+          REQUEST_LIMIT = 2000
           # The human wait: poll one folder every 10s for at most 15 minutes,
           # inside a 25-minute job.
           WAIT_TIMEOUT_SECONDS = 15 * 60
@@ -232,6 +244,13 @@ jobs:
           LAST_NAME = (os.environ.get("POLICYGATE_SIGNER_LAST_NAME") or "").strip()
           SIGNER_EMAIL = (os.environ.get("POLICYGATE_SIGNER_EMAIL") or "").strip()
           SIGNER_NAME = " ".join(p for p in (FIRST_NAME, LAST_NAME) if p) or "Human Approver"
+
+          if not REQUEST:
+              raise SystemExit("FAIL: request_text is empty; nothing to submit to PolicyGate.")
+          if len(REQUEST) > REQUEST_LIMIT:
+              raise SystemExit(
+                  f"FAIL: request_text is {len(REQUEST)} characters; the limit is {REQUEST_LIMIT}."
+              )
 
           workdir = Path(os.environ["DEMO_WORKDIR"])
           workdir.mkdir(parents=True, exist_ok=True)
@@ -325,6 +344,7 @@ jobs:
           try:
               # ================= 1. Live Claude ===============================
               print("\n1. Claude intent extraction (live API)")
+              print(f"   Submitted request: {safe(REQUEST)}")
               request = parse(REQUEST, requested_by="PolicyGate final demo")
               check("live Claude parser used", live_calls["count"] == 1, f"parse_with_claude calls={live_calls['count']}")
               check("model", bool(os.getenv("CLAUDE_MODEL")), str(os.getenv("CLAUDE_MODEL")))
@@ -652,6 +672,15 @@ jobs:
               ]
               print("\n" + "\n".join(stop_block))
 
+              def safe_for_summary(text: str, limit: int = 500) -> str:
+                  """Operator text inside a markdown fence: drop backticks so it
+                  cannot break out, drop unprintables, and cap the length."""
+                  collapsed = " ".join(text.split()).replace("`", "'")
+                  collapsed = "".join(ch for ch in collapsed if ch.isprintable())
+                  return collapsed[:limit] + ("..." if len(collapsed) > limit else "")
+
+              submitted_request = safe_for_summary(REQUEST)
+
               phase_one = [
                   "PHASE 1 — BEFORE HUMAN APPROVAL",
                   "",
@@ -672,6 +701,8 @@ jobs:
                   # Written before the wait, so the evidence survives a timeout.
                   with open(step_summary, "a", encoding="utf-8") as fh:
                       fh.write("## PolicyGate AI — Final Demo\n\n")
+                      fh.write("**Submitted request**\n\n")
+                      fh.write("```text\n" + submitted_request + "\n```\n\n")
                       fh.write("```\n" + "\n".join(phase_one) + "\n```\n\n")
 
               # ================= 10. Human wait phase =========================
