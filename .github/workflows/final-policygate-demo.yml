@@ -167,7 +167,7 @@ jobs:
           export FINAL_AUDIT_PATH="${RUNNER_TEMP}/final-audit.json"
           export DEMO_EVIDENCE_PATH="${RUNNER_TEMP}/demo-evidence.json"
           export DEMO_WORKDIR="${RUNNER_TEMP}/policygate-final-demo"
-          python - <<'PY'
+          python -u - <<'PY'
           import asyncio
           import base64
           import json

@@ -119,7 +119,7 @@ jobs:
         run: |
           set -euo pipefail
           pip install "${RUNNER_TEMP}/foxit-mcp/${FOXIT_MCP_PACKAGE_PATH}"
-          python - <<'PY'
+          python -u - <<'PY'
           import importlib.metadata as meta
           print("foxit-pdf-api-mcp-server", meta.version("foxit-pdf-api-mcp-server"))
           print("mcp client sdk", meta.version("mcp"))
@@ -129,7 +129,7 @@ jobs:
       - name: Drive the Foxit MCP server over stdio against a PolicyGate PDF
         run: |
           set -euo pipefail
-          python - <<'PY'
+          python -u - <<'PY'
           import asyncio
           import json
           import os

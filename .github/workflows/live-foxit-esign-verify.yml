@@ -110,7 +110,7 @@ jobs:
           set -euo pipefail
           export AUDIT_PATH="${RUNNER_TEMP}/final-audit.json"
           export SIGNED_PDF_PATH="${RUNNER_TEMP}/signed-approval.pdf"
-          python - <<'PY'
+          python -u - <<'PY'
           import json
           import os
           import re
