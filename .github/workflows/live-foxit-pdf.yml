@@ -81,7 +81,7 @@ jobs:
       - name: Generate the approval PDF and upload it to Foxit PDF Services
         run: |
           set -euo pipefail
-          python - <<'PY'
+          python -u - <<'PY'
           import os
           import sys
           from hashlib import sha256

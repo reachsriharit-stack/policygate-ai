@@ -59,7 +59,7 @@ jobs:
       - name: Run one live PolicyGate request through Claude
         run: |
           set -euo pipefail
-          python - <<'PY'
+          python -u - <<'PY'
           import os
           import sys
 

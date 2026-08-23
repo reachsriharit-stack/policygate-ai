@@ -72,7 +72,7 @@ jobs:
       - name: Create the Foxit eSign draft from a PolicyGate approval PDF
         run: |
           set -euo pipefail
-          python - <<'PY'
+          python -u - <<'PY'
           import base64
           import json
           import os

@@ -102,7 +102,7 @@ jobs:
           # RUNNER_TEMP, not a path above the workspace: upload-artifact@v4
           # rejects anything outside the workspace root.
           export AUDIT_PATH="${RUNNER_TEMP}/pre-sign-audit.json"
-          python - <<'PY'
+          python -u - <<'PY'
           import json
           import os
           import sys
