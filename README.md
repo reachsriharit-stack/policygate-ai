@@ -42,6 +42,34 @@ Plain English
 
 There is intentionally **no agent-side `sign()` operation**.
 
+## Live integration workflows
+
+Every claim above is exercised by a manual GitHub Actions workflow rather than
+asserted in prose. Each is `workflow_dispatch` only, because each spends real
+money, touches a real cloud account, or emails a real person.
+
+| Workflow | What it proves |
+|---|---|
+| `final-policygate-demo.yml` | The whole chain in one run: live Claude → guardrails → AWS Terraform plan → approval PDF → Foxit MCP → eSign send → waits for the human → verifies the signature → `APPROVED` |
+| `live-claude-test.yml` | One request through the real Claude API, with the offline parser tripwired so a fallback cannot pass as a live call |
+| `live-terraform-plan.yml` | `init`/`validate`/`plan`/`show` against real AWS via GitHub OIDC, hashing the saved plan file. `apply` and `destroy` raise before a command line can be built |
+| `live-foxit-pdf.yml` | A real upload to Foxit PDF Services |
+| `live-foxit-mcp.yml` | The official Foxit MCP server, pinned to a commit, driven over stdio by a real MCP client |
+| `live-foxit-esign-draft.yml` | A real eSign folder created with `sendNow: false` — nothing is emailed |
+| `live-foxit-esign-send.yml` | A real signing invitation to a named human, stopping at `AWAITING_HUMAN_APPROVAL` |
+| `live-foxit-esign-verify.yml` | Standalone verification of an already-signed envelope; also the recovery path if a final-demo run is interrupted |
+| `show-oidc-ids.yml` | Prints the repository identifiers needed to write the AWS OIDC trust policy |
+
+They share a discipline: credentials are never printed (every logged string is
+scrubbed), generated PDFs and plans are deleted rather than uploaded, and the
+run asserts a clean working tree before it finishes. `terraform apply` and
+`terraform destroy` are tripwired in every workflow that touches Terraform.
+
+Required configuration lives in repository **secrets** (`ANTHROPIC_API_KEY`,
+`FOXIT_CLOUD_API_CLIENT_ID`, `FOXIT_CLOUD_API_CLIENT_SECRET`) and **variables**
+(`AWS_ROLE_ARN`, `AWS_REGION`, `FOXIT_CLOUD_API_HOST`). AWS access is by OIDC —
+no access-key secrets exist in this repository.
+
 ## MVP scope
 
 - AWS PostgreSQL / RDS only
@@ -94,6 +122,30 @@ python -m policygate.app examples/reject_request.txt \
 streamlit run policygate/streamlit_app.py
 ```
 
+The page **reports evidence; it does not produce it**. It never calls Claude,
+AWS, Terraform, Foxit MCP or Foxit eSign. Instead it reads `demo-evidence.json`
+— the sanitized record `final-policygate-demo.yml` writes — and walks a reader
+through the nine stages of one real run: request, Claude intent, deterministic
+controls, generated Terraform, the plan and its hash, approval evidence, the
+human boundary, the plan-hash binding, and the final audit.
+
+With no verified evidence present it keeps honest `OFFLINE` / `MOCK` /
+`NOT CONFIGURED` labels. `LIVE` is never a constant in the UI: it is returned
+only by `demo_evidence.badges()`, which yields nothing unless the evidence shows
+a live Claude call with fallback disabled, passing guardrails, a real plan, a
+verified MCP operation, a Foxit `EXECUTED` folder, a matching signer, an
+unchanged plan hash, and no apply or destroy.
+
+To publish a verified run: dispatch the final demo, download its
+`policygate-demo-evidence` artifact, commit it as `demo-evidence.json` (or point
+`POLICYGATE_DEMO_EVIDENCE` at it), and redeploy. **No sample evidence file ships
+in this repository** — a committed example carrying `LIVE` values would be
+indistinguishable on screen from a real run.
+
+The interactive button is labelled **Run local demonstration** and marked as not
+the verified integration run; it is hidden entirely when
+`POLICYGATE_SUBMISSION_MODE=true`.
+
 
 ## Docker demo
 
@@ -125,17 +177,36 @@ signing routes, and a disabled Terraform plan.
 
 ## Live Foxit eSign mode
 
-Foxit eSign uses a separate credential set from PDF Services:
+`foxit_client.py` reaches eSign over one of two transports, selected with
+`FOXIT_ESIGN_TRANSPORT`.
+
+The eSign portal with its own OAuth credentials (the default):
 
 ```bash
+export FOXIT_ESIGN_TRANSPORT=esign_oauth     # default
 export FOXIT_ESIGN_BASE_URL=https://na1.foxitesign.foxit.com
 export FOXIT_ESIGN_CLIENT_ID=...
 export FOXIT_ESIGN_CLIENT_SECRET=...
 ```
 
-The client authenticates, uploads the approval PDF to
-`/api/folders/createfolder`, sets `processTextTags=true`, adds the named human as
-the signing party, and stops. The approval PDF contains Foxit signature/date Text
+Or the Foxit Developer Platform gateway, which authenticates every request with
+the same `FOXIT_CLOUD_API_*` credentials the PDF Services API uses — this is what
+the live workflows run:
+
+```bash
+export FOXIT_ESIGN_TRANSPORT=developer_platform
+export FOXIT_ESIGN_BASE_URL=https://na1.fusion.foxit.com
+export FOXIT_CLOUD_API_CLIENT_ID=...
+export FOXIT_CLOUD_API_CLIENT_SECRET=...
+```
+
+Only the host, route prefix and authentication differ. The request bodies and the
+human-approval boundary are identical, and neither transport has a method that
+signs.
+
+The client authenticates, uploads the approval PDF to the createfolder endpoint,
+sets `processTextTags=true`, adds the named human as the signing party, and
+stops. The approval PDF contains Foxit signature/date Text
 Tags for party 1.
 
 Routing is intentionally explicit. To email the live signing invitation:
@@ -166,9 +237,15 @@ verify Foxit's HMAC signature over the raw request body before finalization.
 
 Foxit's official open-source PDF API MCP server is the sponsor path for reversible
 PDF work. See [`docs/FOXIT.md`](docs/FOXIT.md). PolicyGate keeps eSign outside the
-agent's tool catalog by design. `POLICYGATE_SUBMISSION_MODE=true` requires the MCP
-credentials to be configured, but the submission video must still show a genuine
-MCP tool invocation rather than treating configuration as proof of execution.
+agent's tool catalog by design.
+
+Configuration is not proof of execution, so the MCP path is exercised rather than
+described: `live-foxit-mcp.yml` and `final-policygate-demo.yml` clone the official
+server at a pinned commit, install the current Python implementation, drive it over
+stdio with a real MCP client, discover its tools, and invoke `pdf_compress` on the
+approval PDF. The tools report failure inside their JSON payload rather than as a
+protocol error, so each payload's `success` flag is checked — a Foxit-side failure
+fails the job instead of passing quietly.
 
 ## Generated artifacts
 
@@ -181,6 +258,16 @@ Passing CLI runs write to `artifacts/`:
 
 Blocked requests generate no signature artifact.
 
+The live workflows upload non-secret metadata only:
+
+- `policygate-final-pre-sign-audit` — request ID, folder ID, expected signer,
+  approval PDF hash, approved plan hash
+- `policygate-final-audit` — the same record after a verified signature
+- `policygate-demo-evidence` — the sanitized record the Streamlit UI reads
+
+Neither the approval PDF, the signed PDF, the saved `tfplan`, nor any credential
+is ever uploaded.
+
 ## Tests
 
 ```bash
@@ -188,12 +275,19 @@ python -m unittest discover -s tests -v
 python -m compileall policygate
 ```
 
-The current suite contains **83 tests** covering policy injection, explicit unsafe
+The current suite contains **150 tests** covering policy injection, explicit unsafe
 requests, budgets, regions, human identity/routing requirements, the hard-stop state,
-valid PDF generation, Foxit OAuth/create-folder/status/download behavior, webhook
-signature verification, signer/folder correlation, Terraform generation, exact-plan
-binding, apply regression protection, destroy gating, and submission-mode fail-closed
-checks.
+valid PDF generation, Foxit OAuth/create-folder/status/download behavior on both
+transports, webhook signature verification, signer/folder correlation, Terraform
+generation, exact-plan binding, apply regression protection, destroy gating, and
+submission-mode fail-closed checks.
+
+It also covers the parts that only exist because of the live workflows: the
+approval wait (only `EXECUTED` approves — `COMPLETED` does not), timeout failing
+closed with the pre-sign record untouched, a changed plan hash refusing to
+finalize, the demo-evidence allowlist and its rejection of emails, URLs, AWS
+account IDs, ARNs, access keys, private IPs and Terraform state, and a guard that
+no workflow interpolates dispatch input into a shell block.
 
 ## Submission materials
 
@@ -245,6 +339,13 @@ the submission video. Cost estimates elsewhere in the app are a replayable demo
 catalog, not a live AWS quote. The repository includes Foxit webhook HMAC verification,
 but a deployed HTTP receiver must invoke it on the raw request body before parsing or
 finalizing any webhook.
+
+Two things about the demo surfaces are worth stating plainly. The live workflows
+are manual on purpose: each one spends money, assumes a real AWS role, or emails a
+real person, so none of them run on push. And `demo-evidence.json` is a **snapshot
+of one completed run**, not a live reading — the Streamlit page keeps showing that
+run's result until the file is replaced, which is why its panel is captioned as
+evidence from a completed run rather than as the app's own status.
 
 ## License
 
