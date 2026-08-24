@@ -315,8 +315,26 @@ class SensitiveContentTests(unittest.TestCase):
 class RepositoryHygieneTests(unittest.TestCase):
     """15. No committed file can make the UI claim a verified run."""
 
-    def test_no_evidence_ships_in_the_repository(self):
-        self.assertFalse(demo_evidence.DEFAULT_EVIDENCE_PATH.exists())
+    def test_any_committed_evidence_is_sanitized_and_complete(self):
+        """Publishing a real run's record is the intended workflow, so this no
+        longer forbids the file — it constrains it. Committed evidence must
+        survive the sanitizer (carrying no identity) and describe a *complete*
+        verified run, so a half-finished state can never be published as though
+        it were approved.
+
+        No test can tell a genuine artifact from a hand-written one; nothing in
+        a repository can. That claim is protected procedurally instead: the file
+        is downloaded from a workflow run, and DEMO_SCRIPT.md says in as many
+        words not to write one by hand.
+        """
+        path = demo_evidence.DEFAULT_EVIDENCE_PATH
+        if not path.exists():
+            self.skipTest("no run evidence is published in this checkout")
+        evidence = demo_evidence.load(path)  # raises UnsafeEvidence if it leaks
+        self.assertTrue(
+            demo_evidence.is_verified(evidence),
+            "committed evidence must describe a complete verified run",
+        )
 
     def test_round_trip_from_disk(self):
         with TemporaryDirectory() as tmp:
