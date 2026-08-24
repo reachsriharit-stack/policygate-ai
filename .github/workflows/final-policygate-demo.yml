@@ -271,6 +271,17 @@ jobs:
               return out
 
 
+          def summary_safe(value: object) -> str:
+              """The step summary is published alongside the run. Credentials are
+              already scrubbed by safe(); this also keeps the approver out of it,
+              because a rule's actual value is literally their name or address."""
+              out = safe(value)
+              for identity in (SIGNER_EMAIL, SIGNER_NAME, FIRST_NAME, LAST_NAME):
+                  if identity and len(identity) > 1:
+                      out = out.replace(identity, "provided")
+              return out
+
+
           def fail(message: str) -> None:
               print(f"::error::{safe(message)}")
               raise SystemExit(f"FAIL: {safe(message)}")
@@ -706,7 +717,59 @@ jobs:
                       fh.write("## PolicyGate AI — Final Demo\n\n")
                       fh.write("**Submitted request**\n\n")
                       fh.write("```text\n" + submitted_request + "\n```\n\n")
-                      fh.write("```\n" + "\n".join(phase_one) + "\n```\n\n")
+
+                      # What the model produced, and what deterministic code
+                      # did with it, kept visibly apart. Structured fields
+                      # only — no raw response, no prompt, no identity.
+                      fh.write("### CLAUDE PARSED INTENT\n\n")
+                      fh.write("| Field | Value |\n| --- | --- |\n")
+                      for label, value in (
+                          ("Environment", request.environment),
+                          ("Cloud", str(request.cloud).upper()),
+                          ("Region", request.region),
+                          ("Service / engine", request.database_engine),
+                          ("High availability", "Yes" if request.high_availability else "No"),
+                          (
+                              "Backup retention",
+                              f"{request.backup_retention_days} days"
+                              if request.backup_retention_days is not None
+                              else "not specified",
+                          ),
+                          (
+                              "Monthly budget ceiling",
+                              f"${float(request.monthly_budget_usd):,.0f}"
+                              if request.monthly_budget_usd is not None
+                              else "not specified",
+                          ),
+                          ("Claude API", "LIVE" if live_calls["count"] else "NOT USED"),
+                          (
+                              "AI fallback",
+                              "NO" if os.getenv("POLICYGATE_ALLOW_AI_FALLBACK") == "false" else "ALLOWED",
+                          ),
+                      ):
+                          fh.write(f"| {label} | {safe(value)} |\n")
+                      fh.write(
+                          "\n_Claude extracts intent. Deterministic PolicyGate code "
+                          "decides compliance._\n\n"
+                      )
+
+                      fh.write("### DETERMINISTIC POLICY VALIDATION\n\n")
+                      fh.write("| Rule | Control | Actual | Expected | Result |\n")
+                      fh.write("| --- | --- | --- | --- | --- |\n")
+                      for rule in policy_result.checks:
+                          fh.write(
+                              f"| `{rule.code}` | {summary_safe(rule.description)} | "
+                              f"{summary_safe(rule.actual)} | {summary_safe(rule.expected)} | "
+                              f"{'PASS' if rule.passed else 'FAIL'} |\n"
+                          )
+                      fh.write(
+                          f"\n**Policy result: {'PASS' if policy_result.passed else 'FAIL'}** — "
+                          "decided by rules.py, not by the model.\n\n"
+                      )
+
+                      fh.write(
+                          "```\n" + "\n".join(summary_safe(line) for line in phase_one) + "\n```\n\n"
+                      )
 
               # ================= 10. Human wait phase =========================
               # Read-only polling of this one folder. Nothing here signs,
@@ -952,7 +1015,9 @@ jobs:
 
               if step_summary:
                   with open(step_summary, "a", encoding="utf-8") as fh:
-                      fh.write("```\n" + "\n".join(phase_two) + "\n```\n\n")
+                      fh.write(
+                          "```\n" + "\n".join(summary_safe(line) for line in phase_two) + "\n```\n\n"
+                      )
                       fh.write("<details><summary>Run detail</summary>\n\n")
                       fh.write("| Field | Value |\n| --- | --- |\n")
                       fh.write(f"| Request ID | `{request.request_id}` |\n")
