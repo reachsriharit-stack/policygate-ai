@@ -9,10 +9,15 @@ Built for the **DevNetwork [API + Cloud + AI] Hackathon 2026**, targeting the
 
 ## Why it exists
 
-A production database change in a regulated environment needs a paper trail:
-what was requested, what policy checked, what plan was proposed, and who signed
-off. PolicyGate automates the reversible work but makes human authorization a
-hard code boundary rather than a prompt instruction.
+A production infrastructure change in a regulated environment needs a paper trail:
+what was requested, what policy checked, what execution plan was proposed, and who
+authorized it.
+
+PolicyGate automates the reversible preparation work while making human authorization
+a hard code boundary rather than a prompt instruction.
+
+This hackathon demo uses AWS PostgreSQL provisioning as one concrete infrastructure
+use case.
 
 ```text
 Plain English
@@ -42,6 +47,27 @@ Plain English
 
 There is intentionally **no agent-side `sign()` operation**.
 
+## Demo
+
+🎥 **3-minute demo:** [Watch the PolicyGate demo](YOUR_YOUTUBE_LINK)
+
+🖥️ **Interactive evidence UI:** [policygate.streamlit.app](https://policygate.streamlit.app)
+
+🏗️ **Source:** This repository
+
+### What to watch for
+
+- Real Claude intent extraction
+- Deterministic policy validation
+- Real AWS-backed Terraform plan
+- Exact `tfplan` SHA-256 bound into the approval document
+- Real Foxit MCP document processing
+- Real Foxit eSign human handoff
+- `AWAITING_HUMAN_APPROVAL` hard stop
+- Human signature verification
+- Final `APPROVED` audit
+- `terraform apply` intentionally not run
+
 ## Live integration workflows
 
 Every claim above is exercised by a manual GitHub Actions workflow rather than
@@ -70,7 +96,10 @@ Required configuration lives in repository **secrets** (`ANTHROPIC_API_KEY`,
 (`AWS_ROLE_ARN`, `AWS_REGION`, `FOXIT_CLOUD_API_HOST`). AWS access is by OIDC —
 no access-key secrets exist in this repository.
 
-## MVP scope
+## Demo implementation scope
+
+The governance architecture is infrastructure-oriented; the hackathon implementation
+uses AWS RDS PostgreSQL as the concrete Terraform-managed resource.
 
 - AWS PostgreSQL / RDS only
 - approved-region allow-list
