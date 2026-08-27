@@ -49,7 +49,7 @@ There is intentionally **no agent-side `sign()` operation**.
 
 ## Demo
 
-🎥 **3-minute demo:** [Watch the PolicyGate demo](YOUR_YOUTUBE_LINK)
+🎥 **3-minute demo:** [Watch the PolicyGate demo](https://youtu.be/nz9OZPnQvio)
 
 🖥️ **Interactive evidence UI:** [policygate.streamlit.app](https://policygate.streamlit.app)
 
