@@ -90,6 +90,10 @@ jobs:
           role-session-name: policygate-live-terraform-plan
           # Read-only for the duration of a plan.
           role-duration-seconds: 1800
+          # The account id appears in get-caller-identity output and in the
+          # assumed-role ARN. On a public repository run logs are world
+          # readable, so register it as a masked value.
+          mask-aws-account-id: true
 
       - name: Report assumed AWS identity
         run: |

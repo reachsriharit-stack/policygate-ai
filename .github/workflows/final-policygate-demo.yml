@@ -80,6 +80,26 @@ jobs:
       TF_INPUT: "0"
 
     steps:
+      # First step in the job, so the approver's identity is registered as a
+      # masked value before any later step can echo it. The runner prints the
+      # job-level env block at the start of every step; from here on those
+      # lines read *** instead of a real name and address. This step's own env
+      # block is printed before the mask exists, so one clear-text occurrence
+      # per run remains — dispatch inputs, unlike secrets, cannot be masked
+      # any earlier than this.
+      - name: Mask the approver's identity in all subsequent output
+        run: |
+          set -euo pipefail
+          for value in "${POLICYGATE_SIGNER_EMAIL:-}" \
+                       "${POLICYGATE_SIGNER_FIRST_NAME:-}" \
+                       "${POLICYGATE_SIGNER_LAST_NAME:-}"; do
+            # One-character values would mask far too much of the log.
+            if [ "${#value}" -gt 1 ]; then
+              echo "::add-mask::${value}"
+            fi
+          done
+          echo "Approver identity registered as a masked value."
+
       - name: Check out repository
         uses: actions/checkout@v4
 
@@ -136,6 +156,10 @@ jobs:
           aws-region: ${{ vars.AWS_REGION }}
           role-session-name: policygate-final-demo
           role-duration-seconds: 3600
+          # The account id appears in get-caller-identity output and in the
+          # assumed-role ARN. On a public repository run logs are world
+          # readable, so register it as a masked value.
+          mask-aws-account-id: true
 
       - name: Report assumed AWS identity
         run: |
@@ -656,10 +680,17 @@ jobs:
               pre_sign_terraform_verbs = [cmd[0] for cmd in executed_terraform if cmd]
 
               # ================= 8. Preserve safe metadata ====================
+              # This file is uploaded as a workflow artifact, downloadable by
+              # anyone who can read the repository. It therefore carries no
+              # identity: neither the approver's address nor the Foxit folder
+              # id. The signer stays provable — the address is recorded as a
+              # SHA-256 that anyone holding the address can recompute and
+              # compare, which is all the audit trail needs.
               preserved = {
                   "request_id": audit["request_id"],
-                  "foxit_folder_id": folder_id,
-                  "expected_signer_email": audit["expected_signer_email"],
+                  "expected_signer_sha256": sha256(
+                      audit["expected_signer_email"].strip().lower().encode("utf-8")
+                  ).hexdigest(),
                   "terraform_plan_file_sha256": tfplan_sha256,
                   "unsigned_pdf_sha256": unsigned_pdf_sha256,
                   "mcp_output_pdf_sha256": mcp_pdf_sha256,
