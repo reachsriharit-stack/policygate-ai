@@ -55,6 +55,24 @@ jobs:
       POLICYGATE_SUBMISSION_MODE: "false"
 
     steps:
+      # First step in the job, so the approver's identity is masked before any
+      # later step can echo it. The runner prints the job-level env block at the
+      # start of every step; from here on those lines read ***. This step's own
+      # env block is printed before the mask exists, so one clear-text
+      # occurrence per run remains — dispatch inputs, unlike secrets, cannot be
+      # masked any earlier than this.
+      - name: Mask the approver's identity in all subsequent output
+        run: |
+          set -euo pipefail
+          for value in "${POLICYGATE_SIGNER_EMAIL:-}" \
+                       "${POLICYGATE_SIGNER_FIRST_NAME:-}" \
+                       "${POLICYGATE_SIGNER_LAST_NAME:-}"; do
+            if [ "${#value}" -gt 1 ]; then
+              echo "::add-mask::${value}"
+            fi
+          done
+          echo "Approver identity registered as a masked value."
+
       - name: Check out repository
         uses: actions/checkout@v4
 
@@ -383,6 +401,40 @@ jobs:
               "has stopped: nothing is polled, nothing is approved, and nothing is "
               "provisioned until a verified signature exists."
           )
+          PY
+
+      - name: Strip identity from the artifact copy of the audit
+        run: |
+          set -euo pipefail
+          python -u - <<'PY'
+          import json
+          import os
+          from hashlib import sha256
+          from pathlib import Path
+
+          # The in-run audit record keeps the real address, because the run has
+          # to match it against what Foxit reports. The uploaded copy does not:
+          # an artifact is downloadable by anyone who can read the repository.
+          # Each address becomes a digest, so a holder of the address can still
+          # prove the match and nobody else learns it.
+          path = Path(os.environ["RUNNER_TEMP"]) / "pre-sign-audit.json"
+          record = json.loads(path.read_text(encoding="utf-8"))
+          for key in ("signer_email", "expected_signer_email", "verified_signer_email"):
+              value = record.pop(key, None)
+              if value:
+                  digest = sha256(str(value).strip().lower().encode("utf-8")).hexdigest()
+                  record[f"{key}_sha256"] = digest
+          record.pop("foxit_folder_id", None)
+          path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+
+          remaining = [
+              key for key in record
+              if ("email" in key.lower() or "folder" in key.lower())
+              and not key.endswith("_sha256")
+          ]
+          if remaining:
+              raise SystemExit(f"identity still present in the artifact: {remaining}")
+          print("Artifact copy carries no signer address and no folder id.")
           PY
 
       - name: Preserve the pre-sign audit metadata
