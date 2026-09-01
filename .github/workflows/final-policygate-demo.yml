@@ -541,7 +541,15 @@ jobs:
                       async with stdio_client(mcp_params, errlog=errlog) as (read, write):
                           async with ClientSession(read, write) as session:
                               init = await session.initialize()
-                              server_name = getattr(init.serverInfo, "name", "")
+                              # The MCP SDK exposes this as server_info; serverInfo
+                              # is only the wire alias, and older releases exposed
+                              # the camelCase name as the attribute. Accept either
+                              # so a transitive mcp upgrade cannot break the run.
+                              info = (
+                                  getattr(init, "server_info", None)
+                                  or getattr(init, "serverInfo", None)
+                              )
+                              server_name = getattr(info, "name", "")
                               check("official MCP server started", bool(server_name), server_name)
 
                               listed = await session.list_tools()

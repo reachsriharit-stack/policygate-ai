@@ -303,8 +303,16 @@ jobs:
                       async with ClientSession(read, write) as session:
                           init = await session.initialize()
                           print("\nMCP session")
-                          server_name = getattr(init.serverInfo, "name", "")
-                          check("MCP handshake", bool(server_name), f"{server_name} {getattr(init.serverInfo, 'version', '')}")
+                          # The MCP SDK exposes this as server_info; serverInfo is
+                          # only the wire alias, and older releases exposed the
+                          # camelCase name as the attribute. Accept either so a
+                          # transitive mcp upgrade cannot break the run.
+                          info = (
+                              getattr(init, "server_info", None)
+                              or getattr(init, "serverInfo", None)
+                          )
+                          server_name = getattr(info, "name", "")
+                          check("MCP handshake", bool(server_name), f"{server_name} {getattr(info, 'version', '')}")
 
                           # --- 2. Discover the tools the server registers. ----
                           listed = await session.list_tools()
